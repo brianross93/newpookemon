@@ -1,0 +1,46 @@
+env:
+  rom: "Pokemon Blue.gb"
+  window: "SDL2"
+  speed: 2.0
+  ring_slots: 8
+perception:
+  z_dim: 256
+  smooth_tau: 0.9
+  rnd_dim: 128
+  use_ram: true
+tile_descriptor:
+  tile_size: 8
+  embedding_dim: 64
+  codebook_size: 64
+training:
+  algo: "ppo"
+  num_actors: 1
+  steps_per_actor: 8
+  total_updates: 1
+  lr: 3e-4
+  gamma: 0.997
+  lam: 0.95
+  clip: 0.1
+  c1: 0.5
+  c2: 0.01
+  entropy_coef: 0.01
+  warmup_steps: 8
+policy:
+  hidden_dim: 256
+  num_skills: 4
+  skill_vocab: ["NAVIGATE","INTERACT","MENU_SEQUENCE","WAIT"]
+  gate_temp_start: 1.0
+  gate_temp_end: 0.1
+  gate_reg: 0.001
+nav_planner:
+  thompson_retries: 4
+  epsilon: 1e-3
+executor:
+  watchdog_steps: 40
+brain:
+  enabled: true
+  model: "gpt-5-mini"
+  max_output_tokens: 256
+  candidate_preview: 4
+  enable_web_search: false
+  use_for_rollouts: false
