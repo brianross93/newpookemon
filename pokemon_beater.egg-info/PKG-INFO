@@ -1,3 +1,22 @@
+Metadata-Version: 2.4
+Name: pokemon-beater
+Version: 0.1.0
+Summary: Discovery-first SR-FBAM agent for Pokemon Blue
+Author: Independent
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: torch>=2.2
+Requires-Dist: pyboy>=1.6
+Requires-Dist: pillow>=10.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: tqdm>=4.65
+Requires-Dist: networkx>=3.1
+Requires-Dist: requests>=2.31
+Requires-Dist: python-dotenv>=1.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+
 # PokAcmon Beater
 
 Discovery-first SR-FBAM agent targeting PokÃ©mon Blue automation using sparse symbolic memory, tile-level discovery, and planlet-based control.
@@ -43,28 +62,6 @@ Discovery-first SR-FBAM agent targeting PokÃ©mon Blue automation using sparse 
    ```
 3. Run `python -m beater.main ...` â€” the CLI log will now include GPT suggestions (skill, goal index, reasoning). When `use_for_rollouts` is true, the rollout collector consults GPT for each actor, so expect slower/paid calls.
 
-## LLM Integration Updates
-
-- HALT-gated and async: on `GraphOp.HALT`, a non-blocking request is queued; gameplay continues while waiting.
-- Screenshot context: each HALT includes a small PNG of the frame alongside tile-grid context.
-- Candidate metadata: each candidate includes `passability` and recent `fail_count` to bias away from walls.
-- Menu ops: if GPT returns `ops` with `skill="MENU_SEQUENCE"`, those button presses are executed exactly.
-- Objective spec (optional): GPT may include an `objective_spec` JSON block (`phase`, `reward_weights`, `timeouts.ttl_steps`, `skill_bias`) to steer shaped rewards and bias skills (e.g., menu vs overworld).
-- Staleness guard: directives are ignored if too old or if the candidate set has drifted.
-
-### Brain config keys (configs/default.yaml)
-```yaml
-brain:
-  enabled: true
-  model: "gpt-5-mini"            # Responses API model name
-  candidate_preview: 4            # number of waypoint candidates to surface
-  enable_web_search: true         # allow built-in web_search tool
-  use_for_rollouts: false         # enable GPT during PPO collection (slower/paid)
-  attach_screenshot: true         # attach a PNG of the current frame on HALT
-  max_directive_age_steps: 300    # drop stale directives older than this many steps
-  min_candidate_overlap: 1        # require at least N common candidates when applying a directive
-```
-
 ## Architecture Overview
 ```
 PyBoy Env
@@ -81,9 +78,8 @@ Key files:
 - `beater/sr_memory/graph.py`, `passability.py`
 - `beater/policy/controller.py`, `plan_head.py`, `nav_planner.py`, `affordance.py`, `options.py`, `waypoints.py`
 - `beater/executor/skills.py`, `compiler.py`, `sprite_tracker.py`
-- `beater/brains/gpt.py`, `beater/brains/async_brain.py`
+- `beater/brains/gpt.py`
 - `beater/training/rollouts.py`, `replay.py`, `learner.py`, `rewards.py`
-- `beater/objectives.py`, `beater/utils/detectors.py`
 - `beater/main.py`
 
 ## Remaining Work
@@ -95,16 +91,3 @@ Key files:
 5. **Telemetry & Viz:** Build metrics/viz hooks (reuse ratio, passability calibration, nav success, PPO diagnostics) for training dashboards.
 
 See `PROJECTOVERVIEW.md` for the full spec and next milestones.
-
-## Objective Engine (Shaped Rewards)
-
-- The LLM can optionally provide an `objective_spec` to steer current priorities:
-  - Fields: `phase`, `reward_weights` (e.g., `nav_success`, `sprite_delta`, `scene_change`, `menu_progress`, `name_committed`), `timeouts.ttl_steps`, and `skill_bias` (e.g., `menu`/`overworld`).
-- The engine converts local signals (nav success, sprite delta, scene-change via tile histogram deltas, simple menu/name heuristics) into a scalar reward using the provided weights.
-- A periodic summary is logged every 500 steps for visibility.
-
-## Demo/Debug Tips
-
-- Use `--visual` and set `env.speed: 1.0` in `configs/default.yaml` to make step counts align with visual frames.
-- Async HALT keeps frames moving while GPT responds; reduce the Responses timeout in `beater/brains/gpt.py` for snappier demos if needed.
-- With `--log-level DEBUG`, you’ll see `POST /v1/responses` and `GPTBrain API call #N` lines to track LLM activity.

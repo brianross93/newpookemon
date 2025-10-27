@@ -16,7 +16,8 @@ import random
 
 from beater.env import EnvConfig, PyBoyEnv
 from beater.executor import NavPlanletBuilder, PlanletExecutor, SpriteMovementDetector
-from beater.brains import GPTBrain, GoalSuggestion
+from beater.brains import GPTBrain, GoalSuggestion, AsyncBrain
+from beater.objectives import ObjectiveEngine
 from beater.perception import (
     Perception,
     PerceptionConfig,
@@ -34,7 +35,7 @@ from beater.policy import (
     PlanHead,
     PlanHeadConfig,
 )
-from beater.sr_memory import EntityGraph, PassabilityStore
+from beater.sr_memory import EntityGraph, GraphOp, PassabilityStore
 from beater.training import (
     GroundedRolloutCollector,
     PPOConfig,
@@ -44,6 +45,7 @@ from beater.training import (
 from beater.types import PlanletKind
 
 LOGGER = logging.getLogger("beater")
+GRAPH_OPS: tuple[GraphOp, ...] = tuple(GraphOp)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -186,6 +188,11 @@ def main() -> None:
     perception = build_perception(cfg)
     tile_descriptor = build_tile_descriptor(cfg)
     brain, brain_cfg = build_brain(cfg)
+    async_brain: Optional[AsyncBrain] = AsyncBrain(brain) if brain else None
+    attach_screenshot = bool((brain_cfg or {}).get("attach_screenshot", True))
+    max_directive_age = int((brain_cfg or {}).get("max_directive_age_steps", 300) or 300)
+    min_cand_overlap = int((brain_cfg or {}).get("min_candidate_overlap", 1) or 1)
+    objective = ObjectiveEngine()
     brain_candidate_preview = int(brain_cfg.get("candidate_preview", 4) or 4)
     brain_for_rollouts = brain if brain and brain_cfg.get("use_for_rollouts", False) else None
     controller, plan_head, skill_vocab = build_policy(cfg, perception.config.z_dim)
@@ -208,6 +215,24 @@ def main() -> None:
     last_rollout_stats: dict[str, Any] = {}
 
     obs = env.observe()
+    # Default objective until the first LLM-provided spec arrives
+    try:
+        default_spec = {
+            "phase": "boot",
+            "reward_weights": {
+                "scene_change": 1.0,
+                "sprite_delta": 0.05,
+                "nav_success": 0.5,
+                "menu_progress": 0.25,
+                "name_committed": 0.75,
+            },
+            "timeouts": {"ttl_steps": 1500},
+            "skill_bias": "menu",
+        }
+        objective.set_spec(default_spec, obs.step_idx)
+        LOGGER.info("Objective initialized (default): %s", objective.summary())
+    except Exception:
+        pass
     while env.step_idx - start_step < step_target:
         rgb_tensor = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
         ram_tensor = torch.from_numpy(obs.ram).unsqueeze(0) if obs.ram is not None else None
@@ -227,15 +252,59 @@ def main() -> None:
             candidates = goal_manager_cli.peek_candidates(
                 tile_out.grid_shape, brain_candidate_preview
             )
-            if brain and brain_directive_cli is None and candidates:
-                brain_directive_cli = brain.suggest_goal(
+            ctrl_out = controller(z, controller_state)
+            affordance_logits = affordance(z)
+            gate_dist = Categorical(logits=ctrl_out.gate_logits)
+            skill_logits = ctrl_out.skill_logits + affordance_logits
+            skill_dist = Categorical(logits=skill_logits)
+            gate_action = gate_dist.sample()
+            skill_action = skill_dist.sample()
+            gate_idx = int(gate_action.item())
+            gate_op = GRAPH_OPS[gate_idx % len(GRAPH_OPS)]
+            should_query_brain = (
+                async_brain is not None
+                and brain_directive_cli is None
+                and candidates
+                and gate_op == GraphOp.HALT
+            )
+            if should_query_brain:
+                img_bytes = None
+                if attach_screenshot:
+                    try:
+                        import io
+                        from PIL import Image
+
+                        # Convert observation RGB(A) to PNG bytes
+                        arr = obs.rgb
+                        mode = "RGBA" if arr.shape[-1] == 4 else "RGB"
+                        im = Image.fromarray(arr, mode)
+                        buf = io.BytesIO()
+                        im.save(buf, format="PNG")
+                        img_bytes = buf.getvalue()
+                    except Exception:
+                        img_bytes = None
+                # Build candidate metadata for the prompt
+                cand_meta = []
+                for (r, c) in candidates:
+                    key = tile_grid[r][c]
+                    cls = key.split(":", 1)[-1]
+                    est = pass_store.get_estimate(cls, key)
+                    cand_meta.append({
+                        "passability": est.blended,
+                        "fail_count": goal_manager_cli.get_fail_count((r, c)),
+                    })
+
+                async_brain.request(
                     tile_grid,
                     candidates,
                     {
                         "step": obs.step_idx,
                         "assoc_matches": len(assoc),
                         "passability": nav_est.blended,
+                        "candidate_meta": cand_meta,
                     },
+                    step_idx=obs.step_idx,
+                    image_bytes=img_bytes,
                 )
             brain_goal_override = None
             brain_skill = None
@@ -246,22 +315,39 @@ def main() -> None:
                 brain_notes = brain_directive_cli.reasoning
 
             preferred_kind = brain_skill if brain_skill in skill_vocab else option_bank.suggest()
+            # Bias skills with objective suggestion (menu vs overworld)
+            bias = objective.skill_bias()
+            if bias == "menu" and preferred_kind == "WAIT":
+                preferred_kind = "MENU_SEQUENCE"
+            elif bias == "overworld" and preferred_kind == "WAIT":
+                preferred_kind = "NAVIGATE"
             if preferred_kind is None:
                 preferred_kind = "NAVIGATE"
 
-            ctrl_out = controller(z, controller_state)
-            affordance_logits = affordance(z)
-            gate_dist = Categorical(logits=ctrl_out.gate_logits)
-            skill_logits = ctrl_out.skill_logits + affordance_logits
-            skill_dist = Categorical(logits=skill_logits)
-            gate_action = gate_dist.sample()
-            skill_action = skill_dist.sample()
             planlet = plan_head.decode(
                 skill_logits,
                 ctrl_out.timeout_steps,
                 skill_action=skill_action,
                 preferred_kind=preferred_kind,
             )
+            # If the brain provided explicit MENU_SEQUENCE ops, override the script.
+            if (
+                planlet.kind == "MENU_SEQUENCE"
+                and brain_directive_cli is not None
+                and getattr(brain_directive_cli, "ops", None)
+            ):
+                from beater.types import ScriptOp  # local import to avoid cycles
+
+                menu_ops = list(brain_directive_cli.ops or [])
+                script = []
+                for btn in menu_ops:
+                    script.append(ScriptOp(op="PRESS", button=btn, frames=2))
+                    script.append(ScriptOp(op="WAIT", frames=1))
+                    script.append(ScriptOp(op="RELEASE", button=btn, frames=0))
+                if script:
+                    planlet.args["ops"] = menu_ops
+                    planlet.script = script
+                    planlet.timeout_steps = len(script)
             goal_coord = None
             nav_path: List[tuple[int, int]] = []
             if planlet.kind == "NAVIGATE":
@@ -283,8 +369,28 @@ def main() -> None:
             goal_manager_cli.feedback(goal_coord, bool(planlet.args.get("nav_success", False)))
         option_bank.record(planlet.kind)
         controller_state = ctrl_out.state
+        # Non-blocking: poll for any async brain directive and stage it for next iteration.
+        if async_brain is not None and brain_directive_cli is None:
+            polled = async_brain.poll()
+            if polled is not None:
+                directive, req_step, cand_snap = polled
+                # Staleness guard: drop if too old or candidate overlap too small
+                age = obs.step_idx - int(req_step)
+                overlap = 0
+                try:
+                    cur_set = set(candidates)
+                    snap_set = set(cand_snap)
+                    overlap = len(cur_set & snap_set)
+                except Exception:
+                    overlap = 0
+                if age <= max_directive_age and overlap >= min_cand_overlap:
+                    brain_directive_cli = directive
+                    if getattr(directive, "objective_spec", None):
+                        objective.set_spec(directive.objective_spec, obs.step_idx)
+                        LOGGER.info("Objective updated: %s", objective.summary())
         if brain_directive_cli:
-            brain_directive_cli = None
+            if planlet.kind != "NAVIGATE" or planlet.args.get("nav_success", False):
+                brain_directive_cli = None
         last_rollout_stats = {
             "obs": obs,
             "assoc": assoc,
@@ -294,6 +400,12 @@ def main() -> None:
             "z_shape": tuple(z.shape),
             "rnd_shape": tuple(rnd.shape),
         }
+        # Periodic objective summary for visibility
+        try:
+            if obs.step_idx % 500 == 0:
+                LOGGER.info("Objective summary: %s", objective.summary())
+        except Exception:
+            pass
     perception.reset(context=interactive_context)
     training_goal_manager = GoalManager()
     env_factory = lambda: PyBoyEnv(env.config)
@@ -315,6 +427,7 @@ def main() -> None:
         movement_detector_factory=lambda: SpriteMovementDetector(),
         num_actors=int(train_cfg.get("num_actors", 1)),
         steps_per_actor=int(train_cfg.get("steps_per_actor", 8)),
+        objective=objective,
     )
     total_updates = int(train_cfg.get("total_updates", 1))
     train_stats = {}
@@ -339,6 +452,8 @@ def main() -> None:
         last_rollout_stats.get("nav_path_len"),
         train_stats,
     )
+    if async_brain is not None:
+        async_brain.shutdown()
     env.close()
 
 

@@ -1,7 +1,7 @@
 env:
   rom: "Pokemon Blue.gb"
   window: "SDL2"
-  speed: 2.0
+  speed: 1.0
   ring_slots: 8
 perception:
   z_dim: 256
@@ -40,7 +40,7 @@ executor:
 brain:
   enabled: true
   model: "gpt-5-mini"
-  max_output_tokens: 256
+  max_output_tokens: 2000
   candidate_preview: 4
   enable_web_search: false
   use_for_rollouts: false

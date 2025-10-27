@@ -1,0 +1,2 @@
+[console_scripts]
+pokemon-beater = beater.main:main

@@ -25,7 +25,6 @@ class GoalSuggestion:
     goal_index: Optional[int]
     reasoning: str
     ops: Optional[List[str]] = None
-    objective_spec: Optional[Dict[str, object]] = None
 
     def resolve_goal(self, candidates: Sequence[Coord]) -> Optional[Coord]:
         if self.goal_index is None:
@@ -76,27 +75,6 @@ class GPTBrain:
             candidate_lines.append(
                 f"{idx}: row={row}, col={col}, tile_class={tile_class}"
             )
-        # enrich with optional candidate metadata if provided
-        cand_meta = context.get("candidate_meta") if isinstance(context, dict) else None
-        if isinstance(cand_meta, list) and len(cand_meta) == len(candidates):
-            new_lines: List[str] = []
-            for i, line in enumerate(candidate_lines):
-                meta = cand_meta[i]
-                if isinstance(meta, dict):
-                    p = meta.get("passability")
-                    f = meta.get("fail_count")
-                    extras: List[str] = []
-                    if isinstance(p, (int, float)):
-                        try:
-                            extras.append(f"p={float(p):.2f}")
-                        except Exception:
-                            pass
-                    if isinstance(f, int):
-                        extras.append(f"fails={f}")
-                    if extras:
-                        line = f"{line} (" + ", ".join(extras) + ")"
-                new_lines.append(line)
-            candidate_lines = new_lines
         top_classes = self._top_tile_classes(tile_grid)
         prompt = textwrap.dedent(
             f"""
@@ -137,24 +115,9 @@ class GPTBrain:
             - B: Cancel/backspace (on naming screen).
             - START: Confirm at title; menu accept/confirm name in some screens.
             - SELECT: Rarely used; ignore unless needed.
-
-            Example naming grid (schematic):
-            [ A B C D E F G H I ]
-            [ J K L M N O P Q R ]
-            [ S T U V W X Y Z - ]
-            [   END    ]
-            Use D-Pad to move to a letter and press A; use START or move to END to confirm.
-
-            Optionally include an "objective_spec" to steer phase and reward
-            priorities, e.g. {"phase":"naming","reward_weights":{"scene_change":1.0},
-            "timeouts":{"ttl_steps":500}, "skill_bias":"menu"}.
             """
         ).strip()
         full_prompt = prompt + "\n\n" + prompt_extra
-        # Reinforce requirements: always include objective_spec; web_search allowed.
-        full_prompt += "\n\nREQUIREMENT: Always include an objective_spec with phase, reward_weights, timeouts.ttl_steps, and skill_bias."
-        if self.enable_web_search:
-            full_prompt += "\nYou may call the web_search tool up to 2 times to inform your choice, but your final output must be a single JSON object only."
         if image_bytes is not None:
             b64 = base64.b64encode(image_bytes).decode("ascii")
             data_url = f"data:image/png;base64,{b64}"
@@ -210,13 +173,11 @@ class GPTBrain:
         goal_index = self._coerce_index(data.get("goal_index"))
         reasoning = data.get("reasoning") or data.get("notes") or ""
         ops = self._coerce_ops(data.get("ops"))
-        objective_spec = data.get("objective_spec") if isinstance(data.get("objective_spec"), dict) else None
         return GoalSuggestion(
             skill=skill if isinstance(skill, str) else None,
             goal_index=goal_index,
             reasoning=reasoning.strip(),
             ops=ops,
-            objective_spec=objective_spec,
         )
 
     # ------------------------------------------------------------------ helpers

@@ -15,10 +15,16 @@ class GoalManager:
     def __init__(self):
         self._queue: Deque[Coord] = deque()
         self._score: Dict[Coord, float] = {}
+        self._fail_count: Dict[Coord, int] = {}
 
     def peek_candidates(self, grid_shape: Tuple[int, int], count: int = 4) -> List[Coord]:
+        """Return up to `count` best candidates by priority (not just queue order)."""
         self._ensure_seed(grid_shape)
-        return list(islice(self._queue, 0, min(count, len(self._queue))))
+        center = self.player_anchor(grid_shape)
+        ranked = sorted(
+            list(self._queue), key=lambda c: self._priority(c, center), reverse=True
+        )
+        return ranked[: min(count, len(ranked))]
 
     def next_goal(
         self,
@@ -32,23 +38,34 @@ class GoalManager:
             self._queue.remove(goal_override)
             goal = goal_override
         elif preferred == "NAVIGATE":
-            goal = max(self._queue, key=lambda c: self._distance(c, center))
+            # Choose by distance with penalties for repeated failures and low score.
+            goal = max(self._queue, key=lambda c: self._priority(c, center))
             self._queue.remove(goal)
         else:
             goal = self._queue.popleft()
+        # Re-enqueue at back to avoid immediate repeats regardless of outcome.
         self._queue.append(goal)
         return goal
 
     def feedback(self, goal: Coord, success: bool) -> None:
+        """Update internal scores and cool-down failed goals.
+
+        - Success: increase score and reset fail count.
+        - Failure: decrease score, increment fail count, and keep the goal at the back
+          of the queue so it won't be retried immediately.
+        """
         delta = 1.0 if success else -0.5
         self._score[goal] = self._score.get(goal, 0.0) + delta
-        # Reinsert goal near front if it keeps failing.
-        if not success:
+        if success:
+            self._fail_count[goal] = 0
+        else:
+            self._fail_count[goal] = self._fail_count.get(goal, 0) + 1
+            # Move to the back (if present) to avoid front-of-queue retries.
             try:
                 self._queue.remove(goal)
             except ValueError:
                 pass
-            self._queue.appendleft(goal)
+            self._queue.append(goal)
 
     def player_anchor(self, grid_shape: Tuple[int, int]) -> Coord:
         return (grid_shape[0] // 2, grid_shape[1] // 2)
@@ -76,3 +93,19 @@ class GoalManager:
     @staticmethod
     def _distance(a: Coord, b: Coord) -> float:
         return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def _priority(self, coord: Coord, center: Coord) -> float:
+        """Higher is better. Distance minus failure penalty plus learned score.
+
+        The failure penalty grows sublinearly to allow occasional retries while
+        still diversifying exploration when a boundary is repeatedly hit.
+        """
+        dist = self._distance(coord, center)
+        score = self._score.get(coord, 0.0)
+        fail = self._fail_count.get(coord, 0)
+        penalty = math.sqrt(float(fail)) * 1.0
+        return dist + score - penalty
+
+    # Public helpers -----------------------------------------------------------
+    def get_fail_count(self, coord: Coord) -> int:
+        return int(self._fail_count.get(coord, 0))

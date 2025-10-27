@@ -4,6 +4,7 @@ from .learner import PPOConfig, PPOTrainer
 from .replay import RolloutBatch, RolloutBuffer, RolloutStep
 from .rewards import gate_skill_reward
 from .rollouts import GroundedRolloutCollector
+from beater.objectives import ObjectiveEngine, ObjectiveSpec
 
 __all__ = [
     "PPOConfig",
@@ -13,4 +14,6 @@ __all__ = [
     "RolloutStep",
     "gate_skill_reward",
     "GroundedRolloutCollector",
+    "ObjectiveEngine",
+    "ObjectiveSpec",
 ]
