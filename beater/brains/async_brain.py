@@ -30,6 +30,10 @@ class AsyncBrain:
         self._lock = threading.Lock()
         self._pending: Optional[PendingJob] = None
 
+    def has_pending(self) -> bool:
+        with self._lock:
+            return self._pending is not None and not self._pending.future.done()
+
     def request(
         self,
         tile_grid: List[List[str]],

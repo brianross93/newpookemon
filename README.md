@@ -5,7 +5,7 @@ Discovery-first SR-FBAM agent targeting PokÃ©mon Blue automation using sparse 
 ## System Snapshot
 
 - **Perception:** Slot-friendly encoder with per-actor temporal smoothing plus a tile descriptor that clusters 8x8 RGBA patches into unsupervised terrain classes feeding the Bayesian passability store.
-- **SR-Memory & Navigation:** Entity graph for ASSOC/FOLLOW/WRITE/HALT, Bayesian passability with class+instance Betas, Thompson-sampling nav planner, `GoalManager` waypoints, and a `NavPlanletBuilder` that turns sampled paths into executor-ready planlets.
+- **SR-Memory & Navigation:** Entity graph for ASSOC/FOLLOW/WRITE/HALT, Bayesian passability with class+instance Betas, Thompson-sampling nav planner, `GoalManager` waypoints, passability/portal-weighted goal scoring with short NAV horizons + stuck→HALT recovery, and a `NavPlanletBuilder` that turns sampled paths into executor-ready planlets.
 - **Executor:** Sprite-based pose tracker (central ROI centroid) decides whether movement succeeded and updates passability per-tile with rich telemetry.
 - **Policy & Training:** GRU controller + AffordancePrior, OptionBank-biased skills, and an environment-grounded PPO loop (multi-actor rollout collector, replay buffer, learner) so gate/skill decisions learn from real PyBoy traces and waypoint feedback.
 - **Tooling:** CLI bootstraps PyBoy, executes a nav planlet end-to-end, logs nav path length + PPO stats, and Pytest covers the symbolic graph, passability convergence, nav planner bias, and executor updates.
@@ -48,9 +48,11 @@ Discovery-first SR-FBAM agent targeting PokÃ©mon Blue automation using sparse 
 - HALT-gated and async: on `GraphOp.HALT`, a non-blocking request is queued; gameplay continues while waiting.
 - Screenshot context: each HALT includes a small PNG of the frame alongside tile-grid context.
 - Candidate metadata: each candidate includes `passability` and recent `fail_count` to bias away from walls.
+- Mini-map context: a 11×11 ASCII map (P = player, digits = candidate indices) plus per-candidate `portal_score` inferred from scene changes helps GPT spot exits (stairs/doors).
 - Menu ops: if GPT returns `ops` with `skill="MENU_SEQUENCE"`, those button presses are executed exactly.
 - Objective spec (optional): GPT may include an `objective_spec` JSON block (`phase`, `reward_weights`, `timeouts.ttl_steps`, `skill_bias`) to steer shaped rewards and bias skills (e.g., menu vs overworld).
 - Staleness guard: directives are ignored if too old or if the candidate set has drifted.
+- Stuck→HALT: if a NAVIGATE planlet fails repeatedly with minimal movement, the loop automatically queues another HALT so GPT can reconsider.
 
 ### Brain config keys (configs/default.yaml)
 ```yaml

@@ -25,7 +25,8 @@ from beater.sr_memory import GraphOp, PassabilityStore
 from beater.training.replay import RolloutBuffer, RolloutStep
 import logging
 from beater.objectives import ObjectiveEngine
-from beater.utils.detectors import scene_change_delta, infer_menu_flags
+from beater.utils.detectors import detect_menu_open, infer_menu_flags, scene_change_delta
+from beater.utils.maps import ascii_tile_map
 from beater.types import Observation
 
 RewardFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -141,7 +142,13 @@ class GroundedRolloutCollector:
                 key = tile_grid[r][c]
                 cls = key.split(":", 1)[-1]
                 est = self.pass_store.get_estimate(cls, key)
-                cand_meta.append({"passability": est.blended, "fail_count": self.goal_manager.get_fail_count((r, c))})
+                cand_meta.append({
+                    "passability": est.blended,
+                    "fail_count": self.goal_manager.get_fail_count((r, c)),
+                    "portal_score": 0.0,
+                })
+            ascii_map = ascii_tile_map(tile_grid, self.goal_manager.player_anchor(tile_out.grid_shape), candidates)
+            menu_active = detect_menu_open(actor.last_obs.ram, tile_grid)
             brain_goal = None
             brain_skill = None
             brain_notes = None
@@ -154,21 +161,27 @@ class GroundedRolloutCollector:
                         {
                             "actor": actor.context_id,
                             "step": actor.last_obs.step_idx,
+                            "ascii_map": ascii_map,
                             "candidate_meta": cand_meta,
                         },
                     )
                     actor.brain_directive = directive
                 if directive:
-                    brain_goal = directive.resolve_goal(candidates)
-                    brain_skill = directive.skill
-                    brain_notes = directive.reasoning
-                    # Optionally update objective spec
-                    if self.objective and getattr(directive, "objective_spec", None):
-                        self.objective.set_spec(directive.objective_spec, actor.last_obs.step_idx)
-                        try:
-                            self._logger.info("Objective updated (rollouts): %s", self.objective.summary())
-                        except Exception:
-                            pass
+                    if not getattr(directive, "objective_spec", None):
+                        self._logger.warning("Dropping GPT directive without objective_spec (actor=%s)", actor.context_id)
+                        directive = None
+                        actor.brain_directive = None
+                    else:
+                        brain_goal = directive.resolve_goal(candidates)
+                        brain_skill = directive.skill
+                        brain_notes = directive.reasoning
+                        # Optionally update objective spec
+                        if self.objective:
+                            self.objective.set_spec(directive.objective_spec, actor.last_obs.step_idx)
+                            try:
+                                self._logger.info("Objective updated (rollouts): %s", self.objective.summary())
+                            except Exception:
+                                pass
             preferred_kind = brain_skill if brain_skill in self.skill_vocab else self.option_bank.suggest()
             if preferred_kind is None:
                 preferred_kind = "NAVIGATE"
@@ -206,15 +219,18 @@ class GroundedRolloutCollector:
                 tile_out_next = self.tile_descriptor(next_rgb_tensor)
                 sc_delta = scene_change_delta(tile_out.class_ids, tile_out_next.class_ids, tile_out.grid_shape)
                 menu_prog, name_commit = infer_menu_flags(planlet, sc_delta)
-                shaped = self.objective.reward(
-                    gate_action=gate_action,
-                    skill_action=skill_action,
-                    nav_success=bool(planlet.args.get("nav_success", False)) if planlet.kind == "NAVIGATE" else False,
-                    sprite_delta=float(delta),
-                    scene_change=float(sc_delta),
-                    menu_progress=float(menu_prog),
-                    name_committed=float(name_commit),
-                )
+                shaped = torch.zeros(1)
+                skip_menu_reward = menu_active and planlet.kind not in ("MENU_SEQUENCE", "INTERACT")
+                if not skip_menu_reward:
+                    shaped = self.objective.reward(
+                        gate_action=gate_action,
+                        skill_action=skill_action,
+                        nav_success=bool(planlet.args.get("nav_success", False)) if planlet.kind == "NAVIGATE" else False,
+                        sprite_delta=float(delta),
+                        scene_change=float(sc_delta),
+                        menu_progress=float(menu_prog),
+                        name_committed=float(name_commit),
+                    )
                 reward = reward + shaped
         buffer.add(
             RolloutStep(

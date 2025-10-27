@@ -93,6 +93,9 @@ class GPTBrain:
                             pass
                     if isinstance(f, int):
                         extras.append(f"fails={f}")
+                    portal = meta.get("portal_score")
+                    if isinstance(portal, (int, float)) and float(portal) > 0:
+                        extras.append(f"portal={float(portal):.2f}")
                     if extras:
                         line = f"{line} (" + ", ".join(extras) + ")"
                 new_lines.append(line)
@@ -121,6 +124,9 @@ class GPTBrain:
             }}
             """
         ).strip()
+        ascii_map = context.get("ascii_map") if isinstance(context, dict) else None
+        if isinstance(ascii_map, str) and ascii_map.strip():
+            prompt += f"\nMini-map (P=player, digits=candidate indices):\n{ascii_map}\n"
         # Provide the controller map and an optional ops contract to encourage
         # compact button sequences for MENU_SEQUENCE without forcing them.
         prompt_extra = textwrap.dedent(
@@ -144,10 +150,16 @@ class GPTBrain:
             [ S T U V W X Y Z - ]
             [   END    ]
             Use D-Pad to move to a letter and press A; use START or move to END to confirm.
+            Use the screenshot and mini-map to locate exits (stairs, doors) and plan precise moves.
 
-            Optionally include an "objective_spec" to steer phase and reward
-            priorities, e.g. {"phase":"naming","reward_weights":{"scene_change":1.0},
-            "timeouts":{"ttl_steps":500}, "skill_bias":"menu"}.
+            Always include an "objective_spec" to steer phase and reward priorities.
+            Example:
+            {"objective_spec": {"phase":"naming","reward_weights":{"scene_change":1.0,"sprite_delta":0.1},
+             "timeouts":{"ttl_steps":500}, "skill_bias":"menu"}}
+
+            web_search_policy: Use web_search only when uncertain about the next
+            step or immediately after a significant scene change is detected.
+            Limit to <=2 searches and summarize findings briefly in "reasoning".
             """
         ).strip()
         full_prompt = prompt + "\n\n" + prompt_extra
@@ -155,6 +167,13 @@ class GPTBrain:
         full_prompt += "\n\nREQUIREMENT: Always include an objective_spec with phase, reward_weights, timeouts.ttl_steps, and skill_bias."
         if self.enable_web_search:
             full_prompt += "\nYou may call the web_search tool up to 2 times to inform your choice, but your final output must be a single JSON object only."
+        LOGGER.debug(
+            "HALT request context step=%s phase=%s menu=%s candidates=%s",
+            context.get("step"),
+            context.get("phase"),
+            context.get("menu_open"),
+            len(candidates),
+        )
         if image_bytes is not None:
             b64 = base64.b64encode(image_bytes).decode("ascii")
             data_url = f"data:image/png;base64,{b64}"
@@ -211,6 +230,14 @@ class GPTBrain:
         reasoning = data.get("reasoning") or data.get("notes") or ""
         ops = self._coerce_ops(data.get("ops"))
         objective_spec = data.get("objective_spec") if isinstance(data.get("objective_spec"), dict) else None
+        LOGGER.info(
+            "HALT response step=%s skill=%s goal=%s has_spec=%s",
+            context.get("step"),
+            data.get("skill"),
+            data.get("goal_index"),
+            bool(objective_spec),
+        )
+        LOGGER.debug("HALT response json=%s", data)
         return GoalSuggestion(
             skill=skill if isinstance(skill, str) else None,
             goal_index=goal_index,
