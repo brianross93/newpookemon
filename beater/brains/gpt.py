@@ -162,6 +162,18 @@ class GPTBrain:
             Limit to <=2 searches and summarize findings briefly in "reasoning".
             """
         ).strip()
+        if context.get("naming_hint"):
+            grid = context.get("naming_grid") or ""
+            naming_block = textwrap.dedent(
+                """
+
+                Naming screen instructions:
+                - Use MENU_SEQUENCE ops like ["DOWN","A","RIGHT","A"] to move the cursor and pick letters.
+                - Use B to delete the previous letter.
+                - Move to END then press A (or press START) to submit the name.
+                """
+            ).strip()
+            prompt_extra += f"\n{naming_block}\n{grid}\n"
         full_prompt = prompt + "\n\n" + prompt_extra
         # Reinforce requirements: always include objective_spec; web_search allowed.
         full_prompt += "\n\nREQUIREMENT: Always include an objective_spec with phase, reward_weights, timeouts.ttl_steps, and skill_bias."

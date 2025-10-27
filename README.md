@@ -48,11 +48,14 @@ Discovery-first SR-FBAM agent targeting PokÃ©mon Blue automation using sparse 
 - HALT-gated and async: on `GraphOp.HALT`, a non-blocking request is queued; gameplay continues while waiting.
 - Screenshot context: each HALT includes a small PNG of the frame alongside tile-grid context.
 - Candidate metadata: each candidate includes `passability` and recent `fail_count` to bias away from walls.
-- Mini-map context: a 11×11 ASCII map (P = player, digits = candidate indices) plus per-candidate `portal_score` inferred from scene changes helps GPT spot exits (stairs/doors).
+- Mini-map context: a 11A-11 ASCII map (P = player, digits = candidate indices) plus per-candidate `portal_score` inferred from scene changes helps GPT spot exits (stairs/doors).
 - Menu ops: if GPT returns `ops` with `skill="MENU_SEQUENCE"`, those button presses are executed exactly.
+- Title skipper: a deterministic START/A boot script now runs before the interactive loop so every session begins past the title splash without waiting on GPT.
+- RAM-backed menu guard: a combined RAM/tile detector drops the agent into a menu-handling mode (MENU_SEQUENCE/INTERACT only, auto-`B` closes stray menus, shaped reward pauses) so HALTs no longer freeze gameplay visuals.
+- Naming detector: the RAM text buffer is monitored for the “First, what is your name?” dialog; when it appears we immediately queue a HALT with the screenshot plus a 9×9 naming grid so GPT can drive the cursor and type names deterministically.
 - Objective spec (optional): GPT may include an `objective_spec` JSON block (`phase`, `reward_weights`, `timeouts.ttl_steps`, `skill_bias`) to steer shaped rewards and bias skills (e.g., menu vs overworld).
 - Staleness guard: directives are ignored if too old or if the candidate set has drifted.
-- Stuck→HALT: if a NAVIGATE planlet fails repeatedly with minimal movement, the loop automatically queues another HALT so GPT can reconsider.
+- Stuck?+'HALT: if a NAVIGATE planlet fails repeatedly with minimal movement, the loop automatically queues another HALT so GPT can reconsider.
 
 ### Brain config keys (configs/default.yaml)
 ```yaml

@@ -40,7 +40,6 @@ executor:
 brain:
   enabled: true
   model: "gpt-5-mini"
-  max_output_tokens: 2000
   candidate_preview: 4
   enable_web_search: true
   use_for_rollouts: false

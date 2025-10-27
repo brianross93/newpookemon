@@ -70,6 +70,33 @@ class GoalManager:
     def player_anchor(self, grid_shape: Tuple[int, int]) -> Coord:
         return (grid_shape[0] // 2, grid_shape[1] // 2)
 
+    def unseen_candidates(
+        self,
+        grid_shape: Tuple[int, int],
+        tile_grid: List[List[str]],
+        pass_store,
+        count: int = 4,
+    ) -> List[Coord]:
+        """Return up to `count` coordinates that remain largely unexplored."""
+
+        center = self.player_anchor(grid_shape)
+        unseen: List[Coord] = []
+        for r in range(len(tile_grid)):
+            for c in range(len(tile_grid[r])):
+                key = tile_grid[r][c]
+                cls = key.split(":", 1)[-1]
+                est = pass_store.get_estimate(cls, key)
+                if abs(est.instance_mean - 0.5) < 0.05:
+                    unseen.append((r, c))
+        unseen.sort(key=lambda coord: self._distance(coord, center))
+        dedup: List[Coord] = []
+        for coord in unseen:
+            if coord not in dedup:
+                dedup.append(coord)
+            if len(dedup) >= count:
+                break
+        return dedup
+
     # ------------------------------------------------------------------ helpers
     def _ensure_seed(self, grid_shape: Tuple[int, int]) -> None:
         if not self._queue:

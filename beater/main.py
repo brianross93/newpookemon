@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import numpy as np
 import yaml
 from dotenv import load_dotenv
 from torch.distributions import Categorical
-import random
 import random
 
 from beater.env import EnvConfig, PyBoyEnv
@@ -62,15 +62,116 @@ def _button_script(button: str, press_frames: int = 2, wait_frames: int = 1) -> 
     ]
 
 
-BOOT_SEQUENCE: List[ScriptOp] = (
-    [ScriptOp(op="WAIT", frames=90)]
-    + _button_script("START", press_frames=8, wait_frames=4)
-    + [ScriptOp(op="WAIT", frames=90)]
-    + _button_script("A", press_frames=6, wait_frames=4)
-    + [ScriptOp(op="WAIT", frames=90)]
-    + _button_script("A", press_frames=6, wait_frames=4)
-    + [ScriptOp(op="WAIT", frames=180)]
+BOOT_SEQUENCE: List[ScriptOp] = []
+BOOT_SEQUENCE.append(ScriptOp(op="WAIT", frames=90))
+for _ in range(5):
+    BOOT_SEQUENCE.extend(_button_script("START", press_frames=8, wait_frames=4))
+    BOOT_SEQUENCE.append(ScriptOp(op="WAIT", frames=120))
+BOOT_SEQUENCE.append(ScriptOp(op="WAIT", frames=180))
+
+NAMING_GRID = (
+    "A B C D E F G H I\n"
+    "J K L M N O P Q R\n"
+    "S T U V W X Y Z -\n"
+    "   END (move to END then press A)"
 )
+
+NAMING_LETTER_ROWS: tuple[str, ...] = ("ABCDEFGHI", "JKLMNOPQR", "STUVWXYZ-")
+NAMING_LETTER_COORDS: Dict[str, Tuple[int, int]] = {
+    letter: (row_idx, col_idx)
+    for row_idx, row_letters in enumerate(NAMING_LETTER_ROWS)
+    for col_idx, letter in enumerate(row_letters)
+}
+NAMING_FALLBACK_NAMES: tuple[str, ...] = ("RED", "ASH", "BLUE")
+
+DOWNSTAIRS_EXIT_CANDIDATES: List[Tuple[int, int]] = [
+    (9, 0),
+    (0, 10),
+]
+
+DOWNSTAIRS_EGRESS_SCRIPT: List[ScriptOp] = []
+for _ in range(5):
+    DOWNSTAIRS_EGRESS_SCRIPT.extend(_button_script("DOWN", press_frames=2, wait_frames=1))
+
+NAMING_MAX_ATTEMPTS = 3
+
+
+def _valid_naming_cursor(cursor: Tuple[int, int]) -> bool:
+    row, col = cursor
+    return 0 <= row <= 2 and 0 <= col <= 8
+
+
+def _move_cursor_script(
+    current: Tuple[int, int], target: Tuple[int, int]
+) -> tuple[List[ScriptOp], Tuple[int, int]]:
+    """Return script ops to move between two naming-grid coordinates."""
+
+    script: List[ScriptOp] = []
+    cur_row, cur_col = current
+    tgt_row, tgt_col = target
+
+    # Vertical movement first to avoid overshooting horizontal bars.
+    while cur_row < tgt_row:
+        script.extend(_button_script("DOWN", press_frames=2, wait_frames=1))
+        cur_row += 1
+    while cur_row > tgt_row:
+        script.extend(_button_script("UP", press_frames=2, wait_frames=1))
+        cur_row -= 1
+
+    # Horizontal adjustments.
+    while cur_col < tgt_col:
+        script.extend(_button_script("RIGHT", press_frames=2, wait_frames=1))
+        cur_col += 1
+    while cur_col > tgt_col:
+        script.extend(_button_script("LEFT", press_frames=2, wait_frames=1))
+        cur_col -= 1
+
+    return script, (cur_row, cur_col)
+
+
+def _naming_fallback_script(
+    start_cursor: Optional[Tuple[int, int]],
+    existing_name: Optional[str],
+    target_name: str,
+) -> List[ScriptOp]:
+    """Generate a deterministic fallback typing sequence for the naming screen."""
+
+    cursor = start_cursor if (start_cursor and _valid_naming_cursor(start_cursor)) else (0, 0)
+    name = (existing_name or "").strip()
+    script: List[ScriptOp] = []
+
+    if name:
+        for _ in range(len(name)):
+            script.extend(_button_script("B", press_frames=2, wait_frames=1))
+
+    for letter in target_name.upper():
+        coord = NAMING_LETTER_COORDS.get(letter)
+        if coord is None:
+            continue
+        moves, cursor = _move_cursor_script(cursor, coord)
+        script.extend(moves)
+        script.extend(_button_script("A", press_frames=2, wait_frames=1))
+
+    # Confirm the selection with START to avoid relying on END coordinates.
+    script.extend(_button_script("START", press_frames=2, wait_frames=6))
+    return script
+
+
+def _is_naming_screen(ram: Optional["np.ndarray"]) -> bool:
+    """Heuristic check for the player naming UI by scanning the text buffer."""
+
+    if ram is None or len(ram) < 0xD180:
+        return False
+    window = ram[0xD158 : 0xD158 + 12]
+    pattern = [0x8D, 0x88, 0x8D, 0x93]  # "NAME" in the text encoding.
+    return list(window[:4]) == pattern
+
+
+def _directive_has_naming_ops(directive: GoalSuggestion) -> bool:
+    if directive.skill != "MENU_SEQUENCE":
+        return False
+    ops = getattr(directive, "ops", None)
+    return isinstance(ops, list) and len(ops) > 0
 
 
 def _dismiss_title_screen(
@@ -86,22 +187,28 @@ def _dismiss_title_screen(
     base_ids = tile_out.class_ids.clone()
     grid_shape = tile_out.grid_shape
     last_delta = 0.0
+    last_obs = obs
     for attempt in range(max_cycles):
         obs = env.step_script(BOOT_SEQUENCE)
         rgb_tensor = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
         tile_out = tile_descriptor(rgb_tensor)
-        last_delta = scene_change_delta(base_ids, tile_out.class_ids, tile_out.grid_shape)
-        if last_delta > 0.25:
+        tile_keys = tile_descriptor.tile_keys(tile_out.class_ids, tile_out.grid_shape)
+        tile_grid = tile_descriptor.reshape_tokens(tile_keys[0], tile_out.grid_shape)
+        if detect_menu_open(obs.ram, tile_grid):
             LOGGER.info(
-                "Boot sequence advanced past title (delta=%.3f attempt=%s)",
-                last_delta,
+                "Boot sequence reached interactive menu (attempt=%s step=%s)",
                 attempt + 1,
+                env.step_idx,
             )
             return obs, tile_out.class_ids.clone(), tile_out.grid_shape
+        last_delta = scene_change_delta(base_ids, tile_out.class_ids, tile_out.grid_shape)
+        last_obs = obs
     LOGGER.warning(
-        "Boot sequence exhausted without clear scene change; last_delta=%.3f", last_delta
+        "Boot sequence exhausted without detecting menu; continuing (delta=%.3f step=%s)",
+        last_delta,
+        env.step_idx,
     )
-    return obs, tile_out.class_ids.clone(), tile_out.grid_shape
+    return last_obs, tile_out.class_ids.clone(), tile_out.grid_shape
 
 
 def _reset_portal_score(
@@ -118,6 +225,47 @@ def _reset_portal_score(
     if key in portal_scores:
         LOGGER.info("Portal score reset for coord=%s key=%s", coord, key)
     portal_scores[key] = 0.0
+
+
+def _boost_portal_scores(
+    tile_grid: List[List[str]], portal_scores: Dict[str, float], coords: List[Tuple[int, int]], bonus: float = 2.0
+) -> None:
+    """Give target tiles an immediate portal bonus so goal scoring prefers exits."""
+
+    for (r, c) in coords:
+        if r < 0 or c < 0:
+            continue
+        if r >= len(tile_grid) or c >= len(tile_grid[r]):
+            continue
+        key = tile_grid[r][c]
+        portal_scores[key] = portal_scores.get(key, 0.0) + bonus
+
+
+def _should_random_walk(
+    tile_grid: List[List[str]],
+    anchor: Tuple[int, int],
+    pass_store: PassabilityStore,
+    threshold: float = 0.15,
+) -> bool:
+    """Heuristic: return True when surrounding tiles are largely unknown/blocked."""
+
+    r, c = anchor
+    known = 0
+    open_tiles = 0
+    for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        nr, nc = r + dr, c + dc
+        if nr < 0 or nc < 0 or nr >= len(tile_grid) or nc >= len(tile_grid[nr]):
+            continue
+        key = tile_grid[nr][nc]
+        cls = key.split(":", 1)[-1]
+        est = pass_store.get_estimate(cls, key)
+        # Treat as known if instance mean has diverged from neutral prior.
+        if abs(est.instance_mean - 0.5) > 0.05:
+            known += 1
+            if est.blended > threshold:
+                open_tiles += 1
+    # Random walk when we barely know surroundings or all known tiles are blocked.
+    return known <= 1 or open_tiles == 0
 
 
 def _parse_args() -> argparse.Namespace:
@@ -256,17 +404,25 @@ def main() -> None:
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
     load_dotenv()
     cfg = load_config(args.config)
+    seed = int(cfg.get("seed", 0))
+    if seed:
+        LOGGER.info("Seeding RNGs with %s", seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     env = build_env(cfg, args)
     perception = build_perception(cfg)
     tile_descriptor = build_tile_descriptor(cfg)
     brain, brain_cfg = build_brain(cfg)
     async_brain: Optional[AsyncBrain] = AsyncBrain(brain) if brain else None
     attach_screenshot = bool((brain_cfg or {}).get("attach_screenshot", True))
-    max_directive_age = int((brain_cfg or {}).get("max_directive_age_steps", 2000) or 2000)
-    min_cand_overlap = int((brain_cfg or {}).get("min_candidate_overlap", 0) or 0)
-    halt_cooldown_steps = int((brain_cfg or {}).get("halt_cooldown_steps", 120) or 120)
+    max_directive_age = int((brain_cfg or {}).get("max_directive_age_steps", 2000))
+    min_cand_overlap = int((brain_cfg or {}).get("min_candidate_overlap", 0))
+    halt_cooldown_steps = int((brain_cfg or {}).get("halt_cooldown_steps", 120))
     objective = ObjectiveEngine()
-    brain_candidate_preview = int(brain_cfg.get("candidate_preview", 4) or 4)
+    brain_candidate_preview = int(brain_cfg.get("candidate_preview", 4))
     brain_for_rollouts = brain if brain and brain_cfg.get("use_for_rollouts", False) else None
     controller, plan_head, skill_vocab = build_policy(cfg, perception.config.z_dim)
     affordance = AffordancePrior(perception.config.z_dim, len(skill_vocab))
@@ -282,6 +438,11 @@ def main() -> None:
     committed_goal: Optional[Tuple[int, int]] = None
     commit_steps_remaining = 0
     halt_cooldown = 0
+    phase_halt_pending: Optional[str] = None
+    downstairs_exit_plan: Optional[Planlet] = None
+    downstairs_exit_goal: Optional[Tuple[int, int]] = None
+    downstairs_script_done = False
+    naming_halt_attempts = 0
     nav_planner = build_nav_planner(cfg, pass_store)
     nav_builder = NavPlanletBuilder()
     movement_detector = SpriteMovementDetector()
@@ -290,7 +451,7 @@ def main() -> None:
     LOGGER.info("Environment initialized with ROM=%s", env.config.rom_path)
     controller_state: Optional[ControllerState] = None
     interactive_context = "interactive"
-    step_target = args.max_steps if args.max_steps > 0 else 1
+    step_target = args.max_steps  # 0 => run indefinitely
     start_step = env.step_idx
     brain_directive_cli: Optional[GoalSuggestion] = None
     last_rollout_stats: dict[str, Any] = {}
@@ -298,35 +459,37 @@ def main() -> None:
     obs = env.observe()
     obs, initial_class_ids, initial_grid_shape = _dismiss_title_screen(env, tile_descriptor, obs)
     # Default objective until the first LLM-provided spec arrives
+    default_spec = {
+        "phase": "boot",
+        "reward_weights": {
+            "scene_change": 1.0,
+            "sprite_delta": 0.05,
+            "nav_success": 0.5,
+            "menu_progress": 0.25,
+            "name_committed": 0.75,
+        },
+        "timeouts": {"ttl_steps": 500},
+        "skill_bias": "menu",
+    }
     try:
-        default_spec = {
-            "phase": "boot",
-            "reward_weights": {
-                "scene_change": 1.0,
-                "sprite_delta": 0.05,
-                "nav_success": 0.5,
-                "menu_progress": 0.25,
-                "name_committed": 0.75,
-            },
-            "timeouts": {"ttl_steps": 500},
-            "skill_bias": "menu",
-        }
         objective.set_spec(default_spec, obs.step_idx)
         LOGGER.info("Objective initialized (default): %s", objective.summary())
-    except Exception:
-        pass
-    while env.step_idx - start_step < step_target:
+    except Exception as exc:
+        LOGGER.exception("Failed to apply default objective spec: %s", exc)
+    while step_target == 0 or (env.step_idx - start_step < step_target):
         phase_state = current_phase_tag
         halt_cooldown = max(halt_cooldown - 1, 0)
         menu_cooldown = max(menu_cooldown - 1, 0)
-        menu_open = menu_cooldown > 0
-        rgb_tensor = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
-        ram_tensor = torch.from_numpy(obs.ram).unsqueeze(0) if obs.ram is not None else None
-        if controller_state is None:
-            controller_state = controller.init_state(batch_size=1, device=rgb_tensor.device)
-        with torch.no_grad():
+       menu_open = menu_cooldown > 0
+       rgb_tensor = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
+       ram_tensor = torch.from_numpy(obs.ram).unsqueeze(0) if obs.ram is not None else None
+       if controller_state is None:
+           controller_state = controller.init_state(batch_size=1, device=rgb_tensor.device)
+        naming_cursor: Optional[Tuple[int, int]] = None
+        naming_current_name: str = ""
+        with torch.inference_mode():
             z, rnd = perception(rgb_tensor, ram_tensor, context=interactive_context)
-            graph.add_entity("frame", z.squeeze(0), {"step_idx": obs.step_idx})
+            frame_id = graph.add_entity("frame", z.squeeze(0), {"step_idx": obs.step_idx})
             assoc = graph.assoc(z.squeeze(0), top_k=1)
             tile_out = tile_descriptor(rgb_tensor)
             tile_keys = tile_descriptor.tile_keys(tile_out.class_ids, tile_out.grid_shape)
@@ -334,11 +497,25 @@ def main() -> None:
             anchor = goal_manager_cli.player_anchor(tile_out.grid_shape)
             anchor_key = tile_grid[anchor[0]][anchor[1]]
             _, tile_class = anchor_key.split(":", 1)
-            nav_est = pass_store.update(tile_class, anchor_key, success=True)
+            nav_est = pass_store.get_estimate(tile_class, anchor_key)
             candidates = goal_manager_cli.peek_candidates(
                 tile_out.grid_shape, brain_candidate_preview
             )
+            unseen_for_prompt = goal_manager_cli.unseen_candidates(
+                tile_out.grid_shape, tile_grid, pass_store, brain_candidate_preview
+            )
+            if unseen_for_prompt:
+                merged_candidates: List[Tuple[int, int]] = list(candidates)
+                for coord in unseen_for_prompt:
+                    if coord not in merged_candidates:
+                        merged_candidates.append(coord)
+                candidates = merged_candidates[:brain_candidate_preview]
             ascii_map = ascii_tile_map(tile_grid, anchor, candidates)
+            if portal_scores:
+                for key in list(portal_scores.keys()):
+                    portal_scores[key] *= 0.995
+                    if portal_scores[key] < 1e-3:
+                        portal_scores.pop(key)
             phase_delta = 0.0
             if initial_class_ids is not None and initial_grid_shape is not None:
                 phase_delta = scene_change_delta(initial_class_ids, tile_out.class_ids, tile_out.grid_shape)
@@ -347,12 +524,14 @@ def main() -> None:
                 new_phase = "downstairs"
             if new_phase != current_phase_tag:
                 current_phase_tag = new_phase
+                portal_scores.clear()
                 committed_goal = None
                 commit_steps_remaining = 0
                 if new_phase == "downstairs":
                     try:
-                        portal_scores.clear()
                         _reset_portal_score(tile_grid, portal_scores, (7, 10))
+                        _boost_portal_scores(tile_grid, portal_scores, DOWNSTAIRS_EXIT_CANDIDATES, bonus=3.0)
+                        phase_halt_pending = "downstairs"
                         downstairs_spec = {
                             "phase": "stairs_down",
                             "reward_weights": {
@@ -368,13 +547,81 @@ def main() -> None:
                             "Objective updated (phase->downstairs door focus): %s",
                             objective.summary(),
                         )
-                    except Exception:
-                        pass
-            phase_state = current_phase_tag
+                        if not downstairs_script_done:
+                            try:
+                                obs = env.step_script(DOWNSTAIRS_EGRESS_SCRIPT)
+                                downstairs_script_done = True
+                                LOGGER.info("Ran downstairs egress script to push toward door")
+                                tensor_after = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
+                                tile_out_after = tile_descriptor(tensor_after)
+                                tile_keys_after = tile_descriptor.tile_keys(
+                                    tile_out_after.class_ids, tile_out_after.grid_shape
+                                )
+                                tile_grid_after = tile_descriptor.reshape_tokens(
+                                    tile_keys_after[0], tile_out_after.grid_shape
+                                )
+                                anchor_after = goal_manager_cli.player_anchor(tile_out_after.grid_shape)
+                                best_path: Optional[List[Tuple[int, int]]] = None
+                                best_goal: Optional[Tuple[int, int]] = None
+                                for goal in DOWNSTAIRS_EXIT_CANDIDATES:
+                                    path = nav_planner.plan(tile_grid_after, start=anchor_after, goal=goal)
+                                    if path and len(path) > 1:
+                                        if best_path is None or len(path) < len(best_path):
+                                            best_path = path
+                                            best_goal = goal
+                                if best_path and best_goal:
+                                    downstairs_exit_plan = nav_builder.from_path(
+                                        best_path, tile_grid_after, goal=best_goal
+                                    )
+                                    downstairs_exit_goal = best_goal
+                                    LOGGER.info(
+                                        "Primed downstairs exit plan goal=%s path_len=%s",
+                                        best_goal,
+                                        len(best_path),
+                                    )
+                                initial_class_ids = tile_out_after.class_ids.clone()
+                                continue
+                            except Exception as exc:
+                                downstairs_script_done = True
+                                LOGGER.exception("Downstairs egress script failed: %s", exc)
+                    except Exception as exc:
+                        LOGGER.exception("Failed to set downstairs objective: %s", exc)
+            naming_screen = _is_naming_screen(obs.ram)
+            if naming_screen:
+                menu_cooldown = max(menu_cooldown, 120)
+                halt_cooldown = 0
+                naming_halt_attempts = 0 if brain_directive_cli else naming_halt_attempts
+                if current_phase_tag != "naming":
+                    current_phase_tag = "naming"
+                    try:
+                        naming_spec = {
+                            "phase": "naming",
+                            "reward_weights": {
+                                "scene_change": 0.2,
+                                "menu_progress": 0.6,
+                                "name_committed": 1.0,
+                            },
+                            "timeouts": {"ttl_steps": 600},
+                            "skill_bias": "menu",
+                        }
+                        objective.set_spec(naming_spec, obs.step_idx)
+                        LOGGER.info("Objective updated (phase->naming): %s", objective.summary())
+                    except Exception as exc:
+                        LOGGER.exception("Failed to apply naming objective: %s", exc)
+            elif current_phase_tag == "naming":
+                current_phase_tag = "boot"
+                try:
+                    objective.set_spec(default_spec, obs.step_idx)
+                    LOGGER.info("Objective reset post-naming: %s", objective.summary())
+                except Exception as exc:
+                    LOGGER.exception("Failed to reset naming objective: %s", exc)
+                naming_halt_attempts = 0
             menu_detected = detect_menu_open(obs.ram, tile_grid)
             if menu_detected:
                 menu_cooldown = max(menu_cooldown, 60)
             menu_open = menu_open or menu_detected
+            phase_state = current_phase_tag
+            naming_active = phase_state == "naming"
             ctrl_out = controller(z, controller_state)
             affordance_logits = affordance(z)
             gate_dist = Categorical(logits=ctrl_out.gate_logits)
@@ -384,12 +631,48 @@ def main() -> None:
             skill_action = skill_dist.sample()
             gate_idx = int(gate_action.item())
             gate_op = GRAPH_OPS[gate_idx % len(GRAPH_OPS)]
+            phase_force_halt = phase_halt_pending == phase_state
+            force_brain_halt = ((naming_active and brain_directive_cli is None) or phase_force_halt)
+            try:
+                if gate_op == GraphOp.ASSOC:
+                    assoc_portals = graph.assoc(z.squeeze(0), top_k=3, filter_kind="portal")
+                    for portal_id, score in assoc_portals:
+                        node = graph.nodes.get(portal_id)
+                        coord = node.attrs.get("coord") if node else None
+                        if coord is None:
+                            continue
+                        pr, pc = coord
+                        if pr < 0 or pc < 0 or pr >= len(tile_grid) or pc >= len(tile_grid[pr]):
+                            continue
+                        key = tile_grid[pr][pc]
+                        portal_scores[key] = portal_scores.get(key, 0.0) + float(score)
+                    if assoc_portals:
+                        LOGGER.debug("ASSOC boosted portal scores via %s", assoc_portals)
+                elif gate_op == GraphOp.FOLLOW:
+                    target_key = None
+                    if downstairs_exit_goal:
+                        r, c = downstairs_exit_goal
+                        if 0 <= r < len(tile_grid) and 0 <= c < len(tile_grid[r]):
+                            target_key = tile_grid[r][c]
+                    if target_key is None and portal_scores:
+                        target_key = max(portal_scores.items(), key=lambda kv: kv[1])[0]
+                    if target_key:
+                        portal_scores[target_key] = portal_scores.get(target_key, 0.0) + 2.0
+                        LOGGER.debug("FOLLOW emphasized portal key %s", target_key)
+                elif gate_op == GraphOp.WRITE:
+                    graph.add_entity(
+                        "anchor",
+                        z.squeeze(0),
+                        {"coord": anchor, "phase": phase_state, "step": obs.step_idx},
+                    )
+            except Exception as exc:
+                LOGGER.exception("Graph operation handling failed: %s", exc)
             should_query_brain = (
                 async_brain is not None
                 and brain_directive_cli is None
                 and not async_brain.has_pending()
                 and candidates
-                and gate_op == GraphOp.HALT
+                and (gate_op == GraphOp.HALT or force_brain_halt)
                 and halt_cooldown == 0
             )
             if should_query_brain:
@@ -406,7 +689,8 @@ def main() -> None:
                         buf = io.BytesIO()
                         im.save(buf, format="PNG")
                         img_bytes = buf.getvalue()
-                    except Exception:
+                    except Exception as exc:
+                        LOGGER.exception("Failed to encode screenshot for brain request: %s", exc)
                         img_bytes = None
                 # Build candidate metadata for the prompt
                 cand_meta = []
@@ -420,18 +704,54 @@ def main() -> None:
                         "portal_score": portal_scores.get(key, 0.0),
                     })
 
+                context_payload = {
+                    "step": obs.step_idx,
+                    "assoc_matches": len(assoc),
+                    "passability": nav_est.blended,
+                    "ascii_map": ascii_map,
+                    "phase": phase_state,
+                    "menu_open": menu_open,
+                    "candidate_meta": cand_meta,
+                }
+                if unseen_for_prompt:
+                    context_payload["unseen_candidates"] = unseen_for_prompt
+                if naming_screen:
+                    context_payload["naming_hint"] = True
+                    context_payload["naming_grid"] = NAMING_GRID
+                    context_payload["fallback_names"] = list(NAMING_FALLBACK_NAMES)
+                    # Cursor positions (pixel coords; map to grid)
+                    try:
+                        cursor_y = int(obs.ram[0xCC24] // 16)
+                        cursor_x = int(obs.ram[0xCC25] // 16)
+                        naming_cursor = (cursor_y, cursor_x)
+                        context_payload["cursor_position"] = {"row": cursor_y, "col": cursor_x}
+                        # Decode current name buffer
+                        def decode_poke_text(bytes_arr):
+                            mapping = {
+                                0x80: 'A', 0x81: 'B', 0x82: 'C', 0x83: 'D', 0x84: 'E', 0x85: 'F', 0x86: 'G', 0x87: 'H', 0x88: 'I',
+                                0x89: 'J', 0x8A: 'K', 0x8B: 'L', 0x8C: 'M', 0x8D: 'N', 0x8E: 'O', 0x8F: 'P', 0x90: 'Q', 0x91: 'R',
+                                0x92: 'S', 0x93: 'T', 0x94: 'U', 0x95: 'V', 0x96: 'W', 0x97: 'X', 0x98: 'Y', 0x99: 'Z',
+                                0x9A: '-',
+                                0x50: '',
+                            }
+                            name = ''
+                            for b in bytes_arr:
+                                if b == 0x50:
+                                    break
+                                name += mapping.get(b, '?')
+                            return name
+                        name_buffer = obs.ram[0xD158:0xD158 + 11]
+                        current_name = decode_poke_text(name_buffer)
+                        naming_current_name = current_name
+                        context_payload["current_name"] = current_name if current_name else "empty"
+                        context_payload["preset_options"] = ["RED", "ASH", "JACK"]
+                    except Exception as exc:
+                        LOGGER.exception("Failed to gather naming context: %s", exc)
+
                 async_brain.request(
                     tile_grid,
                     candidates,
-                    {
-                        "step": obs.step_idx,
-                        "assoc_matches": len(assoc),
-                        "passability": nav_est.blended,
-                        "ascii_map": ascii_map,
-                        "phase": phase_state,
-                        "menu_open": menu_open,
-                        "candidate_meta": cand_meta,
-                    },
+                    context_payload,
                     step_idx=obs.step_idx,
                     image_bytes=img_bytes,
                 )
@@ -442,6 +762,10 @@ def main() -> None:
                     len(candidates),
                 )
                 halt_cooldown = halt_cooldown_steps
+                if phase_force_halt:
+                    phase_halt_pending = None
+                if naming_active:
+                    naming_halt_attempts += 1
             brain_goal_override = None
             brain_skill = None
             brain_notes = None
@@ -450,15 +774,18 @@ def main() -> None:
                 brain_skill = brain_directive_cli.skill
                 brain_notes = brain_directive_cli.reasoning
 
-            preferred_kind = brain_skill if brain_skill in skill_vocab else option_bank.suggest()
-            # Bias skills with objective suggestion (menu vs overworld)
             bias = objective.skill_bias()
-            if bias == "menu" and preferred_kind == "WAIT":
-                preferred_kind = "MENU_SEQUENCE"
-            elif bias == "overworld" and preferred_kind == "WAIT":
-                preferred_kind = "NAVIGATE"
-            if menu_open and preferred_kind not in ("MENU_SEQUENCE", "INTERACT"):
-                preferred_kind = "MENU_SEQUENCE"
+            preferred_kind = brain_skill if brain_skill in skill_vocab else option_bank.suggest()
+            menu_bias_active = bias == "menu"
+            if naming_active:
+                preferred_kind = "MENU_SEQUENCE" if brain_directive_cli else "WAIT"
+            else:
+                if bias == "menu" and preferred_kind == "WAIT":
+                    preferred_kind = "MENU_SEQUENCE"
+                elif bias == "overworld" and preferred_kind == "WAIT":
+                    preferred_kind = "NAVIGATE"
+                if menu_open and preferred_kind not in ("MENU_SEQUENCE", "INTERACT"):
+                    preferred_kind = "MENU_SEQUENCE"
             if preferred_kind is None:
                 preferred_kind = "NAVIGATE"
             # If the brain proposed a concrete skill, force that skill index so
@@ -469,15 +796,53 @@ def main() -> None:
                         int(skill_vocab.index(brain_skill))
                     ], device=skill_action.device)
                     skill_action = skill_idx_override
-                except Exception:
-                    pass
+                except Exception as exc:
+                    LOGGER.exception("Failed to override skill index from brain directive: %s", exc)
 
-            planlet = plan_head.decode(
+            fallback_planlet = None
+            if naming_active and brain_directive_cli is None and naming_halt_attempts >= NAMING_MAX_ATTEMPTS:
+                target_name = next(
+                    (name for name in NAMING_FALLBACK_NAMES if name.upper() != (naming_current_name or "").upper()),
+                    NAMING_FALLBACK_NAMES[0],
+                )
+                script = _naming_fallback_script(naming_cursor, naming_current_name, target_name)
+                if not script:
+                    script = []
+                    for btn in ("DOWN", "A", "A"):
+                        script.extend(_button_script(btn, press_frames=2, wait_frames=1))
+                    LOGGER.warning(
+                        "Naming fallback defaulted to legacy script (cursor=%s name=%s)",
+                        naming_cursor,
+                        naming_current_name,
+                    )
+                    fallback_args = {"fallback_name": "legacy"}
+                else:
+                    fallback_args = {"fallback_name": target_name}
+                fallback_planlet = Planlet(
+                    id=str(uuid.uuid4()),
+                    kind="MENU_SEQUENCE",
+                    args=fallback_args,
+                    script=script,
+                    timeout_steps=len(script),
+                )
+                LOGGER.warning(
+                    "Naming fallback triggered after %s failed HALTs (target=%s)",
+                    naming_halt_attempts,
+                    fallback_args.get("fallback_name"),
+                )
+                naming_halt_attempts = 0
+
+            planlet = fallback_planlet or plan_head.decode(
                 skill_logits,
                 ctrl_out.timeout_steps,
                 skill_action=skill_action,
                 preferred_kind=preferred_kind,
             )
+            if phase_state == "downstairs" and downstairs_exit_plan is not None:
+                planlet = downstairs_exit_plan
+                downstairs_exit_plan = None
+                downstairs_exit_goal = None
+                LOGGER.info("Executing primed downstairs exit plan")
             # If the brain provided explicit MENU_SEQUENCE ops, override the script.
             if (
                 planlet.kind == "MENU_SEQUENCE"
@@ -500,7 +865,7 @@ def main() -> None:
                 and getattr(brain_directive_cli, "ops", None)
                 and planlet.kind == "MENU_SEQUENCE"
             )
-            if menu_open:
+            if menu_open and not naming_active:
                 menu_cooldown = max(menu_cooldown, 30)
                 allowed_kind = planlet.kind in ("MENU_SEQUENCE", "INTERACT")
                 auto_close = False
@@ -553,7 +918,8 @@ def main() -> None:
                                 scored[0][1],
                                 len(scored),
                             )
-                    except Exception:
+                    except Exception as exc:
+                        LOGGER.exception("Failed to score navigation candidates: %s", exc)
                         sel_goal = None
                 if sel_goal is None:
                     sel_goal = goal_manager_cli.next_goal(
@@ -563,19 +929,44 @@ def main() -> None:
                     )
                 goal_coord = sel_goal
                 nav_path = nav_planner.plan(tile_grid, start=anchor, goal=goal_coord)
-                # Truncate horizon to 3 steps to adapt quickly
-                if len(nav_path) > 1:
+                if nav_path and len(nav_path) > 1:
+                    # Truncate horizon to adapt quickly
                     horizon_nodes = nav_path[: min(4, len(nav_path))]
                     planlet = nav_builder.from_path(horizon_nodes, tile_grid, goal=goal_coord)
                 else:
-                    planlet.args["goal"] = goal_coord
-                    planlet.args["nav_success"] = False
+                    if _should_random_walk(tile_grid, anchor, pass_store):
+                        steps = random.randint(3, 5)
+                        dirs = random.choices(["UP", "DOWN", "LEFT", "RIGHT"], k=steps)
+                        script: List[ScriptOp] = []
+                        for btn in dirs:
+                            script.extend(_button_script(btn, press_frames=2, wait_frames=1))
+                        planlet = Planlet(
+                            id=str(uuid.uuid4()),
+                            kind="MENU_SEQUENCE",
+                            args={"random_walk": True},
+                            script=script,
+                            timeout_steps=len(script),
+                        )
+                        goal_coord = None
+                        nav_path = []
+                        LOGGER.debug("Sparse neighbourhood detected; executing random walk %s", dirs)
+                    else:
+                        planlet.args["goal"] = goal_coord
+                        planlet.args["nav_success"] = False
             if brain_notes:
                 planlet.args.setdefault("brain_notes", brain_notes)
         obs = executor.run(planlet)
         next_rgb_tensor = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
         next_tile_out = tile_descriptor(next_rgb_tensor)
         next_tile_keys = tile_descriptor.tile_keys(next_tile_out.class_ids, next_tile_out.grid_shape)
+        if planlet.kind == "NAVIGATE":
+            step_results = planlet.args.get("step_results", []) if isinstance(planlet.args, dict) else []
+            if isinstance(step_results, list):
+                for step_result in step_results:
+                    tile_key = step_result.get("tile_id")
+                    if isinstance(tile_key, str):
+                        cls = tile_key.split(":", 1)[-1]
+                        pass_store.update(cls, tile_key, success=bool(step_result.get("success", False)))
         sc_delta = scene_change_delta(tile_out.class_ids, next_tile_out.class_ids, next_tile_out.grid_shape)
         if (
             planlet.kind == "NAVIGATE"
@@ -598,6 +989,15 @@ def main() -> None:
                         sc_delta,
                         portal_scores[goal_key],
                     )
+                    try:
+                        portal_node_id = graph.add_entity(
+                            "portal",
+                            z.squeeze(0),
+                            {"coord": goal_coord, "phase": phase_state, "step": obs.step_idx},
+                        )
+                        graph.add_relation(frame_id, portal_node_id, "seen")
+                    except Exception as exc:
+                        LOGGER.exception("Failed to record portal entity: %s", exc)
         if planlet.kind == "NAVIGATE" and goal_coord is not None:
             goal_manager_cli.feedback(goal_coord, bool(planlet.args.get("nav_success", False)))
         option_bank.record(planlet.kind)
@@ -622,6 +1022,15 @@ def main() -> None:
                             tk2 = tile_descriptor.tile_keys(td2.class_ids, td2.grid_shape)
                             grid2 = tile_descriptor.reshape_tokens(tk2[0], td2.grid_shape)
                             cands2 = goal_manager_cli.peek_candidates(td2.grid_shape, brain_candidate_preview)
+                            unseen2 = goal_manager_cli.unseen_candidates(
+                                td2.grid_shape, grid2, pass_store, brain_candidate_preview
+                            )
+                            if unseen2:
+                                merged2: List[Tuple[int, int]] = list(cands2)
+                                for coord in unseen2:
+                                    if coord not in merged2:
+                                        merged2.append(coord)
+                                cands2 = merged2[:brain_candidate_preview]
                             anchor2 = goal_manager_cli.player_anchor(td2.grid_shape)
                             anchor_key2 = grid2[anchor2[0]][anchor2[1]]
                             cls2 = anchor_key2.split(":", 1)[-1]
@@ -647,7 +1056,8 @@ def main() -> None:
                                     buf = io.BytesIO()
                                     im.save(buf, format="PNG")
                                     img_bytes2 = buf.getvalue()
-                                except Exception:
+                                except Exception as exc:
+                                    LOGGER.exception("Failed to encode stuck HALT screenshot: %s", exc)
                                     img_bytes2 = None
                             ok = async_brain.request(
                                 grid2,
@@ -660,6 +1070,7 @@ def main() -> None:
                                     "phase": phase_state,
                                     "menu_open": menu_open,
                                     "candidate_meta": cand_meta2,
+                                    "unseen_candidates": unseen2,
                                 },
                                 step_idx=obs.step_idx,
                                 image_bytes=img_bytes2,
@@ -667,8 +1078,8 @@ def main() -> None:
                             if ok:
                                 LOGGER.info("Stuck?HALT triggered at step=%s", obs.step_idx)
                                 halt_cooldown = halt_cooldown_steps
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.exception("Error while handling stuck-plan HALT logic: %s", exc)
         # Non-blocking: poll for any async brain directive and stage it for next iteration.
         if async_brain is not None and brain_directive_cli is None:
             polled = async_brain.poll()
@@ -676,6 +1087,10 @@ def main() -> None:
                 directive, req_step, cand_snap = polled
                 if not getattr(directive, "objective_spec", None):
                     LOGGER.warning("Dropping GPT directive (no objective_spec) step=%s", obs.step_idx)
+                    directive = None
+                    cand_snap = []
+                if directive is not None and naming_active and not _directive_has_naming_ops(directive):
+                    LOGGER.warning("Dropping GPT directive without naming ops step=%s", obs.step_idx)
                     directive = None
                     cand_snap = []
                 if directive is None:
@@ -687,7 +1102,8 @@ def main() -> None:
                     cur_set = set(candidates)
                     snap_set = set(cand_snap)
                     overlap = len(cur_set & snap_set)
-                except Exception:
+                except Exception as exc:
+                    LOGGER.exception("Failed to compute candidate overlap: %s", exc)
                     overlap = 0
                 overlap_ok = overlap >= min_cand_overlap
                 if not overlap_ok and overlap == 0:
@@ -707,8 +1123,8 @@ def main() -> None:
                             brain_directive_cli.ops,
                             (brain_directive_cli.objective_spec or {}).get("phase"),
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        LOGGER.exception("Failed logging HALT directive details: %s", exc)
                     halt_cooldown = max(halt_cooldown, halt_cooldown_steps)
         if brain_directive_cli:
             if planlet.kind != "NAVIGATE" or planlet.args.get("nav_success", False):
@@ -726,8 +1142,8 @@ def main() -> None:
         try:
             if obs.step_idx % 500 == 0:
                 LOGGER.info("Objective summary: %s", objective.summary())
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.exception("Failed to log periodic objective summary: %s", exc)
     perception.reset(context=interactive_context)
     training_goal_manager = GoalManager()
     env_factory = lambda: PyBoyEnv(env.config)
