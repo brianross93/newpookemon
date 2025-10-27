@@ -1,6 +1,6 @@
-# PokAcmon Beater
+# Pokemon Beater
 
-Discovery-first SR-FBAM agent targeting PokÃ©mon Blue automation using sparse symbolic memory, tile-level discovery, and planlet-based control.
+Discovery-first SR-FBAM agent targeting Pokemon Blue automation using sparse symbolic memory, tile-level discovery, and planlet-based control.
 
 ## System Snapshot
 
@@ -48,11 +48,12 @@ Discovery-first SR-FBAM agent targeting PokÃ©mon Blue automation using sparse 
 - HALT-gated and async: on `GraphOp.HALT`, a non-blocking request is queued; gameplay continues while waiting.
 - Screenshot context: each HALT includes a small PNG of the frame alongside tile-grid context.
 - Candidate metadata: each candidate includes `passability` and recent `fail_count` to bias away from walls.
+- Unseen frontier hints: HALT payloads now bubble up a shortlist of low-confidence tiles (via the passability store) and interleave them into the candidate list so GPT can bias exploration away from dead walls.
 - Mini-map context: a 11A-11 ASCII map (P = player, digits = candidate indices) plus per-candidate `portal_score` inferred from scene changes helps GPT spot exits (stairs/doors).
 - Menu ops: if GPT returns `ops` with `skill="MENU_SEQUENCE"`, those button presses are executed exactly.
 - Title skipper: a deterministic START/A boot script now runs before the interactive loop so every session begins past the title splash without waiting on GPT.
 - RAM-backed menu guard: a combined RAM/tile detector drops the agent into a menu-handling mode (MENU_SEQUENCE/INTERACT only, auto-`B` closes stray menus, shaped reward pauses) so HALTs no longer freeze gameplay visuals.
-- Naming detector: the RAM text buffer is monitored for the “First, what is your name?” dialog; when it appears we immediately queue a HALT with the screenshot plus a 9×9 naming grid so GPT can drive the cursor and type names deterministically.
+- Naming detector: the RAM text buffer is monitored for the “First, what is your name?” dialog; when it appears we immediately queue a HALT with the screenshot plus a 9×9 naming grid so GPT can drive the cursor and type names deterministically. Repeated HALT failures now trigger a deterministic fallback that clears the buffer and types a rotating fallback name (RED → ASH → BLUE) before confirming with START, so naming sequences no longer stall recordings.
 - Objective spec (optional): GPT may include an `objective_spec` JSON block (`phase`, `reward_weights`, `timeouts.ttl_steps`, `skill_bias`) to steer shaped rewards and bias skills (e.g., menu vs overworld).
 - Staleness guard: directives are ignored if too old or if the candidate set has drifted.
 - Stuck?+'HALT: if a NAVIGATE planlet fails repeatedly with minimal movement, the loop automatically queues another HALT so GPT can reconsider.
@@ -113,3 +114,4 @@ See `PROJECTOVERVIEW.md` for the full spec and next milestones.
 - Use `--visual` and set `env.speed: 1.0` in `configs/default.yaml` to make step counts align with visual frames.
 - Async HALT keeps frames moving while GPT responds; reduce the Responses timeout in `beater/brains/gpt.py` for snappier demos if needed.
 - With `--log-level DEBUG`, you’ll see `POST /v1/responses` and `GPTBrain API call #N` lines to track LLM activity.
+- For a fast regression pass, run `python -m beater.main --config configs/default.yaml --max-steps 5000 --log-level INFO`; review the log for `Objective summary`, `HALT directive applied`, and `Naming fallback` entries to confirm the async brain, objective swaps, and naming guard are exercising correctly.

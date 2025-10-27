@@ -415,6 +415,10 @@ def main() -> None:
     env = build_env(cfg, args)
     perception = build_perception(cfg)
     tile_descriptor = build_tile_descriptor(cfg)
+    # Screenshot cache for HALT attachments
+    last_img_step = -10**9
+    last_img_bytes: Optional[bytes] = None
+    last_tile_sig: Optional[bytes] = None
     brain, brain_cfg = build_brain(cfg)
     async_brain: Optional[AsyncBrain] = AsyncBrain(brain) if brain else None
     attach_screenshot = bool((brain_cfg or {}).get("attach_screenshot", True))
@@ -480,11 +484,12 @@ def main() -> None:
         phase_state = current_phase_tag
         halt_cooldown = max(halt_cooldown - 1, 0)
         menu_cooldown = max(menu_cooldown - 1, 0)
-       menu_open = menu_cooldown > 0
-       rgb_tensor = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
-       ram_tensor = torch.from_numpy(obs.ram).unsqueeze(0) if obs.ram is not None else None
-       if controller_state is None:
-           controller_state = controller.init_state(batch_size=1, device=rgb_tensor.device)
+        commit_steps_remaining = max(commit_steps_remaining - 1, 0)
+        menu_open = menu_cooldown > 0
+        rgb_tensor = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
+        ram_tensor = torch.from_numpy(obs.ram).unsqueeze(0) if obs.ram is not None else None
+        if controller_state is None:
+            controller_state = controller.init_state(batch_size=1, device=rgb_tensor.device)
         naming_cursor: Optional[Tuple[int, int]] = None
         naming_current_name: str = ""
         with torch.inference_mode():
@@ -505,11 +510,11 @@ def main() -> None:
                 tile_out.grid_shape, tile_grid, pass_store, brain_candidate_preview
             )
             if unseen_for_prompt:
-                merged_candidates: List[Tuple[int, int]] = list(candidates)
-                for coord in unseen_for_prompt:
-                    if coord not in merged_candidates:
-                        merged_candidates.append(coord)
-                candidates = merged_candidates[:brain_candidate_preview]
+                interleaved: List[Tuple[int, int]] = []
+                for coord in unseen_for_prompt + candidates:
+                    if coord not in interleaved:
+                        interleaved.append(coord)
+                candidates = interleaved[:brain_candidate_preview]
             ascii_map = ascii_tile_map(tile_grid, anchor, candidates)
             if portal_scores:
                 for key in list(portal_scores.keys()):
@@ -682,13 +687,19 @@ def main() -> None:
                         import io
                         from PIL import Image
 
-                        # Convert observation RGB(A) to PNG bytes
-                        arr = obs.rgb
-                        mode = "RGBA" if arr.shape[-1] == 4 else "RGB"
-                        im = Image.fromarray(arr, mode)
-                        buf = io.BytesIO()
-                        im.save(buf, format="PNG")
-                        img_bytes = buf.getvalue()
+                        tile_sig = tile_out.class_ids.detach().cpu().numpy().tobytes()
+                        if (obs.step_idx - last_img_step) >= 30 or tile_sig != last_tile_sig:
+                            arr = obs.rgb
+                            mode = "RGBA" if arr.shape[-1] == 4 else "RGB"
+                            target_width = max(1, arr.shape[1] // 2)
+                            target_height = max(1, arr.shape[0] // 2)
+                            im = Image.fromarray(arr, mode).resize((target_width, target_height))
+                            buf = io.BytesIO()
+                            im.save(buf, format="PNG")
+                            last_img_bytes = buf.getvalue()
+                            last_img_step = obs.step_idx
+                            last_tile_sig = tile_sig
+                        img_bytes = last_img_bytes
                     except Exception as exc:
                         LOGGER.exception("Failed to encode screenshot for brain request: %s", exc)
                         img_bytes = None
@@ -714,7 +725,7 @@ def main() -> None:
                     "candidate_meta": cand_meta,
                 }
                 if unseen_for_prompt:
-                    context_payload["unseen_candidates"] = unseen_for_prompt
+                    context_payload["unseen_candidates"] = unseen_for_prompt[:brain_candidate_preview]
                 if naming_screen:
                     context_payload["naming_hint"] = True
                     context_payload["naming_grid"] = NAMING_GRID
@@ -901,12 +912,15 @@ def main() -> None:
                     avg_pass = float(sum(ps) / max(1, len(ps)))
                     goal_key = tile_grid[g[0]][g[1]]
                     portal_bonus = portal_scores.get(goal_key, 0.0) * 0.5
-                    return avg_pass + portal_bonus
+                    dist = len(path)
+                    return avg_pass + portal_bonus - 0.01 * dist
 
                 sel_goal = None
-                if brain_goal_override is not None:
+                if commit_steps_remaining > 0 and committed_goal in candidates:
+                    sel_goal = committed_goal
+                if sel_goal is None and brain_goal_override is not None:
                     sel_goal = brain_goal_override
-                else:
+                if sel_goal is None:
                     try:
                         scored = [(g, _score_goal(g)) for g in candidates]
                         scored.sort(key=lambda kv: kv[1], reverse=True)
@@ -933,8 +947,10 @@ def main() -> None:
                     # Truncate horizon to adapt quickly
                     horizon_nodes = nav_path[: min(4, len(nav_path))]
                     planlet = nav_builder.from_path(horizon_nodes, tile_grid, goal=goal_coord)
+                    committed_goal = goal_coord
+                    commit_steps_remaining = max(commit_steps_remaining, 6)
                 else:
-                    if _should_random_walk(tile_grid, anchor, pass_store):
+                    if _should_random_walk(tile_grid, anchor, pass_store) and not menu_open:
                         steps = random.randint(3, 5)
                         dirs = random.choices(["UP", "DOWN", "LEFT", "RIGHT"], k=steps)
                         script: List[ScriptOp] = []
@@ -951,6 +967,7 @@ def main() -> None:
                         nav_path = []
                         LOGGER.debug("Sparse neighbourhood detected; executing random walk %s", dirs)
                     else:
+                        committed_goal = None
                         planlet.args["goal"] = goal_coord
                         planlet.args["nav_success"] = False
             if brain_notes:
@@ -964,6 +981,25 @@ def main() -> None:
             if isinstance(step_results, list):
                 for step_result in step_results:
                     tile_key = step_result.get("tile_id")
+                    if not isinstance(tile_key, str):
+                        rc = step_result.get("rc")
+                        if isinstance(rc, (list, tuple)) and len(rc) == 2:
+                            rr, cc = rc
+                            if (
+                                isinstance(rr, (int, float))
+                                and isinstance(cc, (int, float))
+                            ):
+                                rr_i = int(rr)
+                                cc_i = int(cc)
+                                if (
+                                    0 <= rr_i < next_tile_out.grid_shape[0]
+                                    and 0 <= cc_i < next_tile_out.grid_shape[1]
+                                    and next_tile_keys
+                                    and next_tile_keys[0]
+                                    and rr_i < len(next_tile_keys[0])
+                                    and cc_i < len(next_tile_keys[0][rr_i])
+                                ):
+                                    tile_key = next_tile_keys[0][rr_i][cc_i]
                     if isinstance(tile_key, str):
                         cls = tile_key.split(":", 1)[-1]
                         pass_store.update(cls, tile_key, success=bool(step_result.get("success", False)))
@@ -1026,8 +1062,8 @@ def main() -> None:
                                 td2.grid_shape, grid2, pass_store, brain_candidate_preview
                             )
                             if unseen2:
-                                merged2: List[Tuple[int, int]] = list(cands2)
-                                for coord in unseen2:
+                                merged2: List[Tuple[int, int]] = []
+                                for coord in unseen2 + cands2:
                                     if coord not in merged2:
                                         merged2.append(coord)
                                 cands2 = merged2[:brain_candidate_preview]
@@ -1051,27 +1087,36 @@ def main() -> None:
                                 try:
                                     import io
                                     from PIL import Image
-                                    mode = "RGBA" if obs.rgb.shape[-1] == 4 else "RGB"
-                                    im = Image.fromarray(obs.rgb, mode)
-                                    buf = io.BytesIO()
-                                    im.save(buf, format="PNG")
-                                    img_bytes2 = buf.getvalue()
+                                    tile_sig2 = td2.class_ids.detach().cpu().numpy().tobytes()
+                                    if (obs.step_idx - last_img_step) >= 30 or tile_sig2 != last_tile_sig:
+                                        mode = "RGBA" if obs.rgb.shape[-1] == 4 else "RGB"
+                                        target_width = max(1, obs.rgb.shape[1] // 2)
+                                        target_height = max(1, obs.rgb.shape[0] // 2)
+                                        im = Image.fromarray(obs.rgb, mode).resize((target_width, target_height))
+                                        buf = io.BytesIO()
+                                        im.save(buf, format="PNG")
+                                        last_img_bytes = buf.getvalue()
+                                        last_img_step = obs.step_idx
+                                        last_tile_sig = tile_sig2
+                                    img_bytes2 = last_img_bytes
                                 except Exception as exc:
                                     LOGGER.exception("Failed to encode stuck HALT screenshot: %s", exc)
                                     img_bytes2 = None
+                            context2 = {
+                                "step": obs.step_idx,
+                                "assoc_matches": len(assoc),
+                                "passability": nav_est2.blended,
+                                "ascii_map": ascii_map2,
+                                "phase": phase_state,
+                                "menu_open": menu_open,
+                                "candidate_meta": cand_meta2,
+                            }
+                            if unseen2:
+                                context2["unseen_candidates"] = unseen2[:brain_candidate_preview]
                             ok = async_brain.request(
                                 grid2,
                                 cands2,
-                                {
-                                    "step": obs.step_idx,
-                                    "assoc_matches": len(assoc),
-                                    "passability": nav_est2.blended,
-                                    "ascii_map": ascii_map2,
-                                    "phase": phase_state,
-                                    "menu_open": menu_open,
-                                    "candidate_meta": cand_meta2,
-                                    "unseen_candidates": unseen2,
-                                },
+                                context2,
                                 step_idx=obs.step_idx,
                                 image_bytes=img_bytes2,
                             )
@@ -1108,7 +1153,7 @@ def main() -> None:
                 overlap_ok = overlap >= min_cand_overlap
                 if not overlap_ok and overlap == 0:
                     LOGGER.warning("HALT directive overlap=0 step=%s", obs.step_idx)
-                    overlap_ok = True
+                    overlap_ok = (min_cand_overlap == 0 and not candidates)
                 if age <= max_directive_age and overlap_ok:
                     brain_directive_cli = directive
                     if getattr(directive, "objective_spec", None):
