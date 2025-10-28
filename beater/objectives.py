@@ -55,6 +55,8 @@ class ObjectiveEngine:
         scene_change: float = 0.0,
         menu_progress: float = 0.0,
         name_committed: float = 0.0,
+        portal_triggered: bool = False,
+        interact_completed: float = 0.0,
     ) -> torch.Tensor:
         if not self._spec:
             return torch.tensor([0.0], dtype=torch.float32)
@@ -66,6 +68,10 @@ class ObjectiveEngine:
         r += float(w.get("scene_change", 0.0)) * float(scene_change)
         r += float(w.get("menu_progress", 0.0)) * float(menu_progress)
         r += float(w.get("name_committed", 0.0)) * float(name_committed)
+        if portal_triggered:
+            r += float(w.get("portal_triggered", 0.0))
+        if interact_completed:
+            r += float(w.get("interact_complete", 0.0)) * float(interact_completed)
         return torch.tensor([r], dtype=torch.float32)
 
     def summary(self) -> str:
@@ -73,4 +79,3 @@ class ObjectiveEngine:
             return "objective: <none>"
         ttl = self._spec.timeouts.get("ttl_steps", 0)
         return f"objective: phase={self._spec.phase} bias={self._spec.skill_bias} ttl={ttl} weights={self._spec.reward_weights}"
-

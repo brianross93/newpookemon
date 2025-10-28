@@ -17,41 +17,6 @@ LOGGER = logging.getLogger(__name__)
 
 Coord = Tuple[int, int]
 
-def _naming_preset_ops(target_row: int) -> List[str]:
-    """
-    Build a deterministic button script for rival naming.
-
-    target_row counts from 1 (RED) down the list. We always reset to NEW NAME first.
-    """
-
-    ops: List[str] = ["UP", "UP", "UP", "WAIT_6"]
-    for _ in range(target_row):
-        ops.extend(["DOWN", "WAIT_6"])
-    ops.extend(
-        [
-            "A",
-            "WAIT_20",
-            "A",
-            "WAIT_25",
-            "A",
-            "WAIT_30",
-            "START",
-            "WAIT_25",
-            "A",
-            "WAIT_20",
-        ]
-    )
-    return ops
-
-
-NAMING_PRESET_OPS: Dict[int, List[str]] = {
-    0: _naming_preset_ops(1),  # default NEW NAME -> pick RED
-    1: _naming_preset_ops(1),
-    2: _naming_preset_ops(2),
-    3: _naming_preset_ops(3),
-}
-
-
 @dataclass(slots=True)
 class GoalSuggestion:
     """LLM-provided directive for skills/goals and optional menu ops."""
@@ -136,6 +101,12 @@ class GPTBrain:
                 new_lines.append(line)
             candidate_lines = new_lines
         top_classes = self._top_tile_classes(tile_grid)
+        naming_state = context.get("naming_state") if isinstance(context, dict) else None
+        naming_lines: List[str] = []
+        if isinstance(naming_state, dict) and naming_state.get("active"):
+            naming_lines.append(
+                f"naming_state: kind={naming_state.get('kind')} subscreen={naming_state.get('subscreen')} buffer='{naming_state.get('buffer')}' len={naming_state.get('buffer_len')}"
+            )
         prompt = textwrap.dedent(
             f"""
             You are the high-level reasoning brain for an automated Pokémon Blue agent.
@@ -159,6 +130,8 @@ class GPTBrain:
             }}
             """
         ).strip()
+        if naming_lines:
+            prompt += "\n" + "\n".join(naming_lines)
         ascii_map = context.get("ascii_map") if isinstance(context, dict) else None
         if isinstance(ascii_map, str) and ascii_map.strip():
             prompt += f"\nMini-map (P=player, digits=candidate indices):\n{ascii_map}\n"
@@ -168,9 +141,10 @@ class GPTBrain:
             """
             If you choose skill="MENU_SEQUENCE", you may include an optional field
             "ops" as an array of controller buttons to press next, chosen from
-            ["A","B","START","SELECT","UP","DOWN","LEFT","RIGHT"]. Keep
+            ["A","B","START","SELECT","UP","DOWN","LEFT","RIGHT"]. You may also use
+            WAIT tokens like "WAIT_30" to insert pauses. Keep
             sequences short (<= 12 ops). Example:
-            {"skill":"MENU_SEQUENCE","goal_index":-1,"ops":["START","A","A"],"reasoning":"..."}
+            {"skill":"MENU_SEQUENCE","goal_index":-1,"ops":["A","WAIT_30","A"],"reasoning":"..."}
 
             Controller Map (Game Boy):
             - UP/DOWN/LEFT/RIGHT: Move selection or cursor.
@@ -184,7 +158,7 @@ class GPTBrain:
             [ J K L M N O P Q R ]
             [ S T U V W X Y Z - ]
             [   END    ]
-            Use D-Pad to move to a letter and press A; use START or move to END to confirm.
+            Use D-Pad to move to a letter and press A; move to END then press A to confirm.
             Use the screenshot and mini-map to locate exits (stairs, doors) and plan precise moves.
 
             Always include an "objective_spec" to steer phase and reward priorities.
@@ -204,10 +178,10 @@ class GPTBrain:
 
                 Naming screen instructions:
                 - Use MENU_SEQUENCE ops like ["DOWN","A","RIGHT","A"] to move the cursor and pick letters.
-                - Use B to delete the previous letter.
-                - Move to END then press A (or press START) to submit the name.
+                - Use B to delete the previous letter or return from the grid to the preset list.
+                - Move to END then press A to submit the name (avoid START on this screen).
                 - You may also select a preset option (e.g., RED/ASH/JACK) by moving to it and pressing A.
-                - When on the naming screen you MUST reply with skill="MENU_SEQUENCE" and provide an "ops" array describing the exact button presses to either enter a name or choose a preset. Do not choose NAVIGATE, WAIT, or INTERACT in this state.
+                - When on the naming screen you MUST reply with skill="MENU_SEQUENCE". Provide an "ops" array if you have a confident plan; if not, return an empty list and explain briefly.
                 """
             ).strip()
             prompt_extra += f"\n{naming_block}\n{grid}\n"
@@ -295,40 +269,29 @@ class GPTBrain:
                 payload_json,
             )
             return None
-        preset_idx: Optional[int] = None
         data = self._parse_json(text)
         if data is None:
             return None
-        if context.get("naming_hint"):
-            if data.get("skill") != "MENU_SEQUENCE":
-                forced_idx = self._coerce_index(data.get("goal_index"))
-                if forced_idx not in NAMING_PRESET_OPS:
-                    forced_idx = 1
-                ops_override = NAMING_PRESET_OPS[forced_idx]
-                original_reason = data.get("reasoning") or ""
-                data["skill"] = "MENU_SEQUENCE"
-                data["goal_index"] = -1
-                data["ops"] = ops_override
-                data["reasoning"] = (original_reason + " Auto-converted to preset MENU_SEQUENCE.").strip()
-                preset_idx = forced_idx
-                LOGGER.info(
-                    "Naming auto-conversion applied step=%s preset_idx=%s ops=%s raw_skill=%s",
-                    (context or {}).get("step"),
-                    forced_idx,
-                    ops_override,
-                    data.get("skill"),
-                )
-            else:
-                preset_idx = self._coerce_index(data.get("goal_index"))
-                if preset_idx not in NAMING_PRESET_OPS:
-                    preset_idx = 1
+        if context.get("naming_hint") and data.get("skill") != "MENU_SEQUENCE":
+            original_reason = data.get("reasoning") or ""
+            raw_skill = data.get("skill")
+            data["skill"] = "MENU_SEQUENCE"
+            data["goal_index"] = -1
+            data["reasoning"] = (original_reason + " Adjusted to MENU_SEQUENCE for naming screen.").strip()
+            LOGGER.info(
+                "Naming coercion applied step=%s raw_skill=%s",
+                (context or {}).get("step"),
+                raw_skill,
+            )
         skill = data.get("skill")
         goal_index = self._coerce_index(data.get("goal_index"))
         reasoning = data.get("reasoning") or data.get("notes") or ""
         ops = self._coerce_ops(data.get("ops"))
         if context.get("naming_hint") and not ops:
-            idx = preset_idx if preset_idx in NAMING_PRESET_OPS else (goal_index if goal_index in NAMING_PRESET_OPS else 1)
-            ops = NAMING_PRESET_OPS.get(idx, ["DOWN", "A"])
+            LOGGER.debug(
+                "Naming directive without ops step=%s (fallback will apply).",
+                (context or {}).get("step"),
+            )
         objective_spec = data.get("objective_spec") if isinstance(data.get("objective_spec"), dict) else None
         LOGGER.info(
             "HALT response step=%s skill=%s goal=%s has_spec=%s",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch.distributions import Categorical
@@ -31,6 +31,16 @@ from beater.types import Observation
 
 RewardFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 GRAPH_OPS: tuple[GraphOp, ...] = tuple(GraphOp)
+MAP_GROUP_ADDR = 0xD35F
+MAP_ID_ADDR = 0xD35E
+
+
+def _map_tuple_from_ram(ram: Optional["numpy.ndarray"]) -> Optional[Tuple[int, int]]:
+    if ram is None:
+        return None
+    if len(ram) <= MAP_GROUP_ADDR:
+        return None
+    return (int(ram[MAP_GROUP_ADDR]), int(ram[MAP_ID_ADDR]))
 
 
 @dataclass(slots=True)
@@ -209,7 +219,16 @@ class GroundedRolloutCollector:
             if brain_notes:
                 planlet.args.setdefault("brain_notes", brain_notes)
             prev_obs = actor.last_obs
+            map_before = _map_tuple_from_ram(prev_obs.ram)
             next_obs = actor.executor.run(planlet)
+            map_after = _map_tuple_from_ram(next_obs.ram)
+            portal_triggered = bool(
+                map_before is not None and map_after is not None and map_after != map_before
+            )
+            interact_completed = 0.0
+            if isinstance(planlet.args, dict) and planlet.kind == "MENU_SEQUENCE":
+                if planlet.args.get("known_entity"):
+                    interact_completed = 1.0
             reward = self.reward_fn(gate_action, skill_action)
             # Add objective-shaped reward if configured
             if self.objective is not None:
@@ -230,6 +249,8 @@ class GroundedRolloutCollector:
                         scene_change=float(sc_delta),
                         menu_progress=float(menu_prog),
                         name_committed=float(name_commit),
+                        portal_triggered=portal_triggered,
+                        interact_completed=interact_completed,
                     )
                 reward = reward + shaped
         buffer.add(
