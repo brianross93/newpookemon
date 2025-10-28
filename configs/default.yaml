@@ -38,10 +38,12 @@ nav_planner:
 executor:
   watchdog_steps: 40
 brain:
+  attach_screenshot: true
   enabled: true
   model: "gpt-5-mini"
+  max_output_tokens: 100000
   candidate_preview: 4
-  enable_web_search: true
+  enable_web_search: false
   use_for_rollouts: false
   max_directive_age_steps: 2000
   min_candidate_overlap: 0

@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 import random
 from collections import deque
-from itertools import islice
 from typing import Deque, Dict, List, Optional, Tuple
 
 Coord = Tuple[int, int]
@@ -80,9 +79,15 @@ class GoalManager:
         """Return up to `count` coordinates that remain largely unexplored."""
 
         center = self.player_anchor(grid_shape)
+        cr, cc = center
+        radius = 4
         unseen: List[Coord] = []
-        for r in range(len(tile_grid)):
-            for c in range(len(tile_grid[r])):
+        r0 = max(0, cr - radius)
+        r1 = min(len(tile_grid) - 1, cr + radius)
+        c0 = max(0, cc - radius)
+        c1 = min(len(tile_grid[0]) - 1, cc + radius)
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
                 key = tile_grid[r][c]
                 cls = key.split(":", 1)[-1]
                 est = pass_store.get_estimate(cls, key)

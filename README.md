@@ -53,7 +53,7 @@ Discovery-first SR-FBAM agent targeting Pokemon Blue automation using sparse sym
 - Menu ops: if GPT returns `ops` with `skill="MENU_SEQUENCE"`, those button presses are executed exactly.
 - Title skipper: a deterministic START/A boot script now runs before the interactive loop so every session begins past the title splash without waiting on GPT.
 - RAM-backed menu guard: a combined RAM/tile detector drops the agent into a menu-handling mode (MENU_SEQUENCE/INTERACT only, auto-`B` closes stray menus, shaped reward pauses) so HALTs no longer freeze gameplay visuals.
-- Naming detector: the RAM text buffer is monitored for the “First, what is your name?” dialog; when it appears we immediately queue a HALT with the screenshot plus a 9×9 naming grid so GPT can drive the cursor and type names deterministically. Repeated HALT failures now trigger a deterministic fallback that clears the buffer and types a rotating fallback name (RED → ASH → BLUE) before confirming with START, so naming sequences no longer stall recordings.
+- Naming detector: the RAM text buffer is monitored for the “First, what is your name?” dialog; when it appears we immediately queue a HALT with the screenshot plus a 9×9 naming grid so GPT can drive the cursor and type names deterministically. If the LLM stalls, the agent simply keeps waiting—no scripted button fallback.
 - Objective spec (optional): GPT may include an `objective_spec` JSON block (`phase`, `reward_weights`, `timeouts.ttl_steps`, `skill_bias`) to steer shaped rewards and bias skills (e.g., menu vs overworld).
 - Staleness guard: directives are ignored if too old or if the candidate set has drifted.
 - Stuck?+'HALT: if a NAVIGATE planlet fails repeatedly with minimal movement, the loop automatically queues another HALT so GPT can reconsider.
@@ -114,4 +114,4 @@ See `PROJECTOVERVIEW.md` for the full spec and next milestones.
 - Use `--visual` and set `env.speed: 1.0` in `configs/default.yaml` to make step counts align with visual frames.
 - Async HALT keeps frames moving while GPT responds; reduce the Responses timeout in `beater/brains/gpt.py` for snappier demos if needed.
 - With `--log-level DEBUG`, you’ll see `POST /v1/responses` and `GPTBrain API call #N` lines to track LLM activity.
-- For a fast regression pass, run `python -m beater.main --config configs/default.yaml --max-steps 5000 --log-level INFO`; review the log for `Objective summary`, `HALT directive applied`, and `Naming fallback` entries to confirm the async brain, objective swaps, and naming guard are exercising correctly.
+- For a fast regression pass, run `python -m beater.main --config configs/default.yaml --max-steps 5000 --log-level INFO`; review the log for `Objective summary` and `HALT directive applied` entries to confirm the async brain and objective swaps are exercising correctly.

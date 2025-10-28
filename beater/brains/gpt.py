@@ -9,12 +9,47 @@ import textwrap
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 import base64
+import re
 
 import requests
 
 LOGGER = logging.getLogger(__name__)
 
 Coord = Tuple[int, int]
+
+def _naming_preset_ops(target_row: int) -> List[str]:
+    """
+    Build a deterministic button script for rival naming.
+
+    target_row counts from 1 (RED) down the list. We always reset to NEW NAME first.
+    """
+
+    ops: List[str] = ["UP", "UP", "UP", "WAIT_6"]
+    for _ in range(target_row):
+        ops.extend(["DOWN", "WAIT_6"])
+    ops.extend(
+        [
+            "A",
+            "WAIT_20",
+            "A",
+            "WAIT_25",
+            "A",
+            "WAIT_30",
+            "START",
+            "WAIT_25",
+            "A",
+            "WAIT_20",
+        ]
+    )
+    return ops
+
+
+NAMING_PRESET_OPS: Dict[int, List[str]] = {
+    0: _naming_preset_ops(1),  # default NEW NAME -> pick RED
+    1: _naming_preset_ops(1),
+    2: _naming_preset_ops(2),
+    3: _naming_preset_ops(3),
+}
 
 
 @dataclass(slots=True)
@@ -41,7 +76,7 @@ class GPTBrain:
     def __init__(
         self,
         model: str = "gpt-5-mini",
-        max_output_tokens: int = 256,
+        max_output_tokens: int = 100_000,
         base_url: str = "https://api.openai.com/v1",
         enabled: bool = True,
         enable_web_search: bool = False,
@@ -171,6 +206,8 @@ class GPTBrain:
                 - Use MENU_SEQUENCE ops like ["DOWN","A","RIGHT","A"] to move the cursor and pick letters.
                 - Use B to delete the previous letter.
                 - Move to END then press A (or press START) to submit the name.
+                - You may also select a preset option (e.g., RED/ASH/JACK) by moving to it and pressing A.
+                - When on the naming screen you MUST reply with skill="MENU_SEQUENCE" and provide an "ops" array describing the exact button presses to either enter a name or choose a preset. Do not choose NAVIGATE, WAIT, or INTERACT in this state.
                 """
             ).strip()
             prompt_extra += f"\n{naming_block}\n{grid}\n"
@@ -209,6 +246,8 @@ class GPTBrain:
                 "input": full_prompt,
                 "max_output_tokens": self.max_output_tokens,
             }
+        payload["text"] = {"format": {"type": "json_object"}, "verbosity": "low"}
+        payload["reasoning"] = {"effort": "low"}
         if self.enable_web_search:
             payload["tools"] = [{"type": "web_search"}]
         headers = {
@@ -217,30 +256,79 @@ class GPTBrain:
         }
         try:
             self.call_count += 1
-            LOGGER.info("GPTBrain API call #%d", self.call_count)
+            LOGGER.info(
+                "GPTBrain API call #%d payload_size=%s bytes ctx_step=%s",
+                self.call_count,
+                len(json.dumps(payload)),
+                (context or {}).get("step"),
+            )
             response = self.session.post(
                 f"{self.base_url}/responses",
                 headers=headers,
                 json=payload,
                 timeout=30,
             )
+            LOGGER.debug(
+                "GPTBrain API call #%d status=%s",
+                self.call_count,
+                response.status_code,
+            )
             response.raise_for_status()
         except requests.RequestException as exc:
             detail = ""
             if hasattr(exc, "response") and exc.response is not None:
                 detail = exc.response.text
-            LOGGER.warning("GPTBrain request failed: %s %s", exc, detail)
+            LOGGER.warning(
+                "GPTBrain request failed (call #%s): %s %s payload=%s",
+                self.call_count,
+                exc,
+                detail,
+                json.dumps(payload),
+            )
             return None
-        text = self._extract_text(response.json())
+        payload_json = response.json()
+        text = self._extract_text(payload_json)
         if not text:
+            LOGGER.warning(
+                "GPTBrain empty output step=%s payload=%s",
+                (context or {}).get("step"),
+                payload_json,
+            )
             return None
+        preset_idx: Optional[int] = None
         data = self._parse_json(text)
         if data is None:
             return None
+        if context.get("naming_hint"):
+            if data.get("skill") != "MENU_SEQUENCE":
+                forced_idx = self._coerce_index(data.get("goal_index"))
+                if forced_idx not in NAMING_PRESET_OPS:
+                    forced_idx = 1
+                ops_override = NAMING_PRESET_OPS[forced_idx]
+                original_reason = data.get("reasoning") or ""
+                data["skill"] = "MENU_SEQUENCE"
+                data["goal_index"] = -1
+                data["ops"] = ops_override
+                data["reasoning"] = (original_reason + " Auto-converted to preset MENU_SEQUENCE.").strip()
+                preset_idx = forced_idx
+                LOGGER.info(
+                    "Naming auto-conversion applied step=%s preset_idx=%s ops=%s raw_skill=%s",
+                    (context or {}).get("step"),
+                    forced_idx,
+                    ops_override,
+                    data.get("skill"),
+                )
+            else:
+                preset_idx = self._coerce_index(data.get("goal_index"))
+                if preset_idx not in NAMING_PRESET_OPS:
+                    preset_idx = 1
         skill = data.get("skill")
         goal_index = self._coerce_index(data.get("goal_index"))
         reasoning = data.get("reasoning") or data.get("notes") or ""
         ops = self._coerce_ops(data.get("ops"))
+        if context.get("naming_hint") and not ops:
+            idx = preset_idx if preset_idx in NAMING_PRESET_OPS else (goal_index if goal_index in NAMING_PRESET_OPS else 1)
+            ops = NAMING_PRESET_OPS.get(idx, ["DOWN", "A"])
         objective_spec = data.get("objective_spec") if isinstance(data.get("objective_spec"), dict) else None
         LOGGER.info(
             "HALT response step=%s skill=%s goal=%s has_spec=%s",
@@ -329,11 +417,20 @@ class GPTBrain:
             return None
         if not isinstance(value, list):
             return None
-        allowed = {"UP", "DOWN", "LEFT", "RIGHT", "A", "B", "START", "SELECT"}
+        allowed_buttons = {"UP", "DOWN", "LEFT", "RIGHT", "A", "B", "START", "SELECT", "NOOP"}
         ops: List[str] = []
         for v in value:
             if isinstance(v, str):
                 vv = v.strip().upper()
-                if vv in allowed:
+                if vv in allowed_buttons:
                     ops.append(vv)
+                    continue
+                if vv.startswith("WAIT"):
+                    if vv == "WAIT":
+                        ops.append("WAIT_10")
+                        continue
+                    match = re.fullmatch(r"WAIT[_\-](\d+)", vv)
+                    if match:
+                        ops.append(f"WAIT_{match.group(1)}")
+                        continue
         return ops or None

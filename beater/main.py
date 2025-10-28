@@ -82,7 +82,6 @@ NAMING_LETTER_COORDS: Dict[str, Tuple[int, int]] = {
     for row_idx, row_letters in enumerate(NAMING_LETTER_ROWS)
     for col_idx, letter in enumerate(row_letters)
 }
-NAMING_FALLBACK_NAMES: tuple[str, ...] = ("RED", "ASH", "BLUE")
 
 DOWNSTAIRS_EXIT_CANDIDATES: List[Tuple[int, int]] = [
     (9, 0),
@@ -93,7 +92,6 @@ DOWNSTAIRS_EGRESS_SCRIPT: List[ScriptOp] = []
 for _ in range(5):
     DOWNSTAIRS_EGRESS_SCRIPT.extend(_button_script("DOWN", press_frames=2, wait_frames=1))
 
-NAMING_MAX_ATTEMPTS = 3
 
 
 def _valid_naming_cursor(cursor: Tuple[int, int]) -> bool:
@@ -127,34 +125,6 @@ def _move_cursor_script(
         cur_col -= 1
 
     return script, (cur_row, cur_col)
-
-
-def _naming_fallback_script(
-    start_cursor: Optional[Tuple[int, int]],
-    existing_name: Optional[str],
-    target_name: str,
-) -> List[ScriptOp]:
-    """Generate a deterministic fallback typing sequence for the naming screen."""
-
-    cursor = start_cursor if (start_cursor and _valid_naming_cursor(start_cursor)) else (0, 0)
-    name = (existing_name or "").strip()
-    script: List[ScriptOp] = []
-
-    if name:
-        for _ in range(len(name)):
-            script.extend(_button_script("B", press_frames=2, wait_frames=1))
-
-    for letter in target_name.upper():
-        coord = NAMING_LETTER_COORDS.get(letter)
-        if coord is None:
-            continue
-        moves, cursor = _move_cursor_script(cursor, coord)
-        script.extend(moves)
-        script.extend(_button_script("A", press_frames=2, wait_frames=1))
-
-    # Confirm the selection with START to avoid relying on END coordinates.
-    script.extend(_button_script("START", press_frames=2, wait_frames=6))
-    return script
 
 
 def _is_naming_screen(ram: Optional["np.ndarray"]) -> bool:
@@ -439,6 +409,8 @@ def main() -> None:
     initial_grid_shape: Optional[Tuple[int, int]] = None
     current_phase_tag = "boot"
     menu_cooldown = 0
+    naming_cooldown = 0
+    naming_cooldown_steps = int((brain_cfg or {}).get("naming_cooldown_steps", 600))
     committed_goal: Optional[Tuple[int, int]] = None
     commit_steps_remaining = 0
     halt_cooldown = 0
@@ -446,7 +418,6 @@ def main() -> None:
     downstairs_exit_plan: Optional[Planlet] = None
     downstairs_exit_goal: Optional[Tuple[int, int]] = None
     downstairs_script_done = False
-    naming_halt_attempts = 0
     nav_planner = build_nav_planner(cfg, pass_store)
     nav_builder = NavPlanletBuilder()
     movement_detector = SpriteMovementDetector()
@@ -484,6 +455,7 @@ def main() -> None:
         phase_state = current_phase_tag
         halt_cooldown = max(halt_cooldown - 1, 0)
         menu_cooldown = max(menu_cooldown - 1, 0)
+        naming_cooldown = max(naming_cooldown - 1, 0)
         commit_steps_remaining = max(commit_steps_remaining - 1, 0)
         menu_open = menu_cooldown > 0
         rgb_tensor = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
@@ -595,9 +567,9 @@ def main() -> None:
             if naming_screen:
                 menu_cooldown = max(menu_cooldown, 120)
                 halt_cooldown = 0
-                naming_halt_attempts = 0 if brain_directive_cli else naming_halt_attempts
                 if current_phase_tag != "naming":
                     current_phase_tag = "naming"
+                    naming_cooldown = naming_cooldown_steps
                     try:
                         naming_spec = {
                             "phase": "naming",
@@ -615,12 +587,12 @@ def main() -> None:
                         LOGGER.exception("Failed to apply naming objective: %s", exc)
             elif current_phase_tag == "naming":
                 current_phase_tag = "boot"
+                naming_cooldown = 0
                 try:
                     objective.set_spec(default_spec, obs.step_idx)
                     LOGGER.info("Objective reset post-naming: %s", objective.summary())
                 except Exception as exc:
                     LOGGER.exception("Failed to reset naming objective: %s", exc)
-                naming_halt_attempts = 0
             menu_detected = detect_menu_open(obs.ram, tile_grid)
             if menu_detected:
                 menu_cooldown = max(menu_cooldown, 60)
@@ -681,8 +653,11 @@ def main() -> None:
                 and halt_cooldown == 0
             )
             if should_query_brain:
+                if naming_active and naming_cooldown > 0:
+                    continue
                 img_bytes = None
-                if attach_screenshot:
+                need_screenshot = attach_screenshot or naming_active
+                if need_screenshot:
                     try:
                         import io
                         from PIL import Image
@@ -700,6 +675,11 @@ def main() -> None:
                             last_img_step = obs.step_idx
                             last_tile_sig = tile_sig
                         img_bytes = last_img_bytes
+                        LOGGER.debug(
+                            "HALT screenshot prepared step=%s naming=%s",
+                            obs.step_idx,
+                            naming_active,
+                        )
                     except Exception as exc:
                         LOGGER.exception("Failed to encode screenshot for brain request: %s", exc)
                         img_bytes = None
@@ -729,7 +709,6 @@ def main() -> None:
                 if naming_screen:
                     context_payload["naming_hint"] = True
                     context_payload["naming_grid"] = NAMING_GRID
-                    context_payload["fallback_names"] = list(NAMING_FALLBACK_NAMES)
                     # Cursor positions (pixel coords; map to grid)
                     try:
                         cursor_y = int(obs.ram[0xCC24] // 16)
@@ -776,10 +755,10 @@ def main() -> None:
                 if phase_force_halt:
                     phase_halt_pending = None
                 if naming_active:
-                    naming_halt_attempts += 1
-            brain_goal_override = None
-            brain_skill = None
-            brain_notes = None
+                    naming_cooldown = naming_cooldown_steps
+                    brain_goal_override = None
+                    brain_skill = None
+                    brain_notes = None
             if brain_directive_cli:
                 brain_goal_override = brain_directive_cli.resolve_goal(candidates)
                 brain_skill = brain_directive_cli.skill
@@ -810,40 +789,7 @@ def main() -> None:
                 except Exception as exc:
                     LOGGER.exception("Failed to override skill index from brain directive: %s", exc)
 
-            fallback_planlet = None
-            if naming_active and brain_directive_cli is None and naming_halt_attempts >= NAMING_MAX_ATTEMPTS:
-                target_name = next(
-                    (name for name in NAMING_FALLBACK_NAMES if name.upper() != (naming_current_name or "").upper()),
-                    NAMING_FALLBACK_NAMES[0],
-                )
-                script = _naming_fallback_script(naming_cursor, naming_current_name, target_name)
-                if not script:
-                    script = []
-                    for btn in ("DOWN", "A", "A"):
-                        script.extend(_button_script(btn, press_frames=2, wait_frames=1))
-                    LOGGER.warning(
-                        "Naming fallback defaulted to legacy script (cursor=%s name=%s)",
-                        naming_cursor,
-                        naming_current_name,
-                    )
-                    fallback_args = {"fallback_name": "legacy"}
-                else:
-                    fallback_args = {"fallback_name": target_name}
-                fallback_planlet = Planlet(
-                    id=str(uuid.uuid4()),
-                    kind="MENU_SEQUENCE",
-                    args=fallback_args,
-                    script=script,
-                    timeout_steps=len(script),
-                )
-                LOGGER.warning(
-                    "Naming fallback triggered after %s failed HALTs (target=%s)",
-                    naming_halt_attempts,
-                    fallback_args.get("fallback_name"),
-                )
-                naming_halt_attempts = 0
-
-            planlet = fallback_planlet or plan_head.decode(
+            planlet = plan_head.decode(
                 skill_logits,
                 ctrl_out.timeout_steps,
                 skill_action=skill_action,
@@ -861,15 +807,37 @@ def main() -> None:
                 and getattr(brain_directive_cli, "ops", None)
             ):
                 menu_ops = list(brain_directive_cli.ops or [])
-                script = []
+                script: List[ScriptOp] = []
+                total_frames = 0
                 for btn in menu_ops:
-                    script.append(ScriptOp(op="PRESS", button=btn, frames=2))
-                    script.append(ScriptOp(op="WAIT", frames=1))
+                    if btn.startswith("WAIT"):
+                        try:
+                            frames = int(btn.split("_", 1)[1])
+                        except (IndexError, ValueError):
+                            frames = 10
+                        script.append(ScriptOp(op="WAIT", frames=max(frames, 1)))
+                        total_frames += max(frames, 1)
+                        continue
+                    if btn == "NOOP":
+                        script.append(ScriptOp(op="WAIT", frames=1))
+                        total_frames += 1
+                        continue
+                    press_frames = 3 if naming_active else 2
+                    settle_frames = 4 if naming_active else 1
+                    script.append(ScriptOp(op="PRESS", button=btn, frames=press_frames))
+                    total_frames += press_frames
+                    script.append(ScriptOp(op="WAIT", frames=settle_frames))
+                    total_frames += settle_frames
                     script.append(ScriptOp(op="RELEASE", button=btn, frames=0))
                 if script:
                     planlet.args["ops"] = menu_ops
                     planlet.script = script
-                    planlet.timeout_steps = len(script)
+                    planlet.timeout_steps = max(planlet.timeout_steps, total_frames + 30)
+                    LOGGER.info(
+                        "Applied brain MENU_SEQUENCE ops step=%s ops=%s",
+                        obs.step_idx,
+                        menu_ops,
+                    )
             menu_bias_active = bias == "menu"
             brain_has_ops = (
                 brain_directive_cli is not None
@@ -892,7 +860,7 @@ def main() -> None:
                         args={"auto_menu": True},
                         script=script,
                         timeout_steps=len(script),
-                    )
+            )
             goal_coord = None
             nav_path: List[tuple[int, int]] = []
             if planlet.kind == "NAVIGATE":
@@ -937,10 +905,10 @@ def main() -> None:
                         sel_goal = None
                 if sel_goal is None:
                     sel_goal = goal_manager_cli.next_goal(
-                        tile_out.grid_shape,
-                        preferred=planlet.kind,
-                        goal_override=brain_goal_override,
-                    )
+                    tile_out.grid_shape,
+                    preferred=planlet.kind,
+                    goal_override=brain_goal_override,
+                )
                 goal_coord = sel_goal
                 nav_path = nav_planner.plan(tile_grid, start=anchor, goal=goal_coord)
                 if nav_path and len(nav_path) > 1:
@@ -968,8 +936,8 @@ def main() -> None:
                         LOGGER.debug("Sparse neighbourhood detected; executing random walk %s", dirs)
                     else:
                         committed_goal = None
-                        planlet.args["goal"] = goal_coord
-                        planlet.args["nav_success"] = False
+                    planlet.args["goal"] = goal_coord
+                    planlet.args["nav_success"] = False
             if brain_notes:
                 planlet.args.setdefault("brain_notes", brain_notes)
         obs = executor.run(planlet)
@@ -1038,7 +1006,7 @@ def main() -> None:
             goal_manager_cli.feedback(goal_coord, bool(planlet.args.get("nav_success", False)))
         option_bank.record(planlet.kind)
         controller_state = ctrl_out.state
-        # If stuck, proactively trigger a HALT request (non-blocking)
+        # If stuck, log it but avoid resubmitting HALT requests while one is pending.
         try:
             if planlet.kind == "NAVIGATE":
                 sr = planlet.args.get("step_results", []) if isinstance(planlet.args, dict) else []
@@ -1046,83 +1014,12 @@ def main() -> None:
                     fails = sum(1 for s in sr if not bool(s.get("success", False)))
                     mean_delta = sum(float(s.get("delta", 0.0)) for s in sr) / max(1, len(sr))
                     if fails / max(1, len(sr)) >= 0.7 and mean_delta < 0.2:
-                        if (
-                            async_brain is not None
-                            and brain_directive_cli is None
-                            and not async_brain.has_pending()
-                            and halt_cooldown == 0
-                        ):
-                            # Recompute candidates on the latest frame
-                            rgb2 = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
-                            td2 = tile_descriptor(rgb2)
-                            tk2 = tile_descriptor.tile_keys(td2.class_ids, td2.grid_shape)
-                            grid2 = tile_descriptor.reshape_tokens(tk2[0], td2.grid_shape)
-                            cands2 = goal_manager_cli.peek_candidates(td2.grid_shape, brain_candidate_preview)
-                            unseen2 = goal_manager_cli.unseen_candidates(
-                                td2.grid_shape, grid2, pass_store, brain_candidate_preview
-                            )
-                            if unseen2:
-                                merged2: List[Tuple[int, int]] = []
-                                for coord in unseen2 + cands2:
-                                    if coord not in merged2:
-                                        merged2.append(coord)
-                                cands2 = merged2[:brain_candidate_preview]
-                            anchor2 = goal_manager_cli.player_anchor(td2.grid_shape)
-                            anchor_key2 = grid2[anchor2[0]][anchor2[1]]
-                            cls2 = anchor_key2.split(":", 1)[-1]
-                            nav_est2 = pass_store.get_estimate(cls2, anchor_key2)
-                            ascii_map2 = ascii_tile_map(grid2, anchor2, cands2)
-                            cand_meta2 = []
-                            for (r, c) in cands2:
-                                key2 = grid2[r][c]
-                                cls_c2 = key2.split(":", 1)[-1]
-                                est2 = pass_store.get_estimate(cls_c2, key2)
-                                cand_meta2.append({
-                                    "passability": est2.blended,
-                                    "fail_count": goal_manager_cli.get_fail_count((r, c)),
-                                    "portal_score": portal_scores.get(key2, 0.0),
-                                })
-                            img_bytes2 = None
-                            if attach_screenshot:
-                                try:
-                                    import io
-                                    from PIL import Image
-                                    tile_sig2 = td2.class_ids.detach().cpu().numpy().tobytes()
-                                    if (obs.step_idx - last_img_step) >= 30 or tile_sig2 != last_tile_sig:
-                                        mode = "RGBA" if obs.rgb.shape[-1] == 4 else "RGB"
-                                        target_width = max(1, obs.rgb.shape[1] // 2)
-                                        target_height = max(1, obs.rgb.shape[0] // 2)
-                                        im = Image.fromarray(obs.rgb, mode).resize((target_width, target_height))
-                                        buf = io.BytesIO()
-                                        im.save(buf, format="PNG")
-                                        last_img_bytes = buf.getvalue()
-                                        last_img_step = obs.step_idx
-                                        last_tile_sig = tile_sig2
-                                    img_bytes2 = last_img_bytes
-                                except Exception as exc:
-                                    LOGGER.exception("Failed to encode stuck HALT screenshot: %s", exc)
-                                    img_bytes2 = None
-                            context2 = {
-                                "step": obs.step_idx,
-                                "assoc_matches": len(assoc),
-                                "passability": nav_est2.blended,
-                                "ascii_map": ascii_map2,
-                                "phase": phase_state,
-                                "menu_open": menu_open,
-                                "candidate_meta": cand_meta2,
-                            }
-                            if unseen2:
-                                context2["unseen_candidates"] = unseen2[:brain_candidate_preview]
-                            ok = async_brain.request(
-                                grid2,
-                                cands2,
-                                context2,
-                                step_idx=obs.step_idx,
-                                image_bytes=img_bytes2,
-                            )
-                            if ok:
-                                LOGGER.info("Stuck?HALT triggered at step=%s", obs.step_idx)
-                                halt_cooldown = halt_cooldown_steps
+                        LOGGER.debug(
+                            "Stuck detection suppressed (fails=%s, mean_delta=%.3f, step=%s)",
+                            fails,
+                            mean_delta,
+                            obs.step_idx,
+                        )
         except Exception as exc:
             LOGGER.exception("Error while handling stuck-plan HALT logic: %s", exc)
         # Non-blocking: poll for any async brain directive and stage it for next iteration.
