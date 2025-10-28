@@ -73,34 +73,13 @@ class GoalManager:
         self,
         grid_shape: Tuple[int, int],
         tile_grid: List[List[str]],
-        pass_store,
         count: int = 4,
     ) -> List[Coord]:
         """Return up to `count` coordinates that remain largely unexplored."""
 
-        center = self.player_anchor(grid_shape)
-        cr, cc = center
-        radius = 4
-        unseen: List[Coord] = []
-        r0 = max(0, cr - radius)
-        r1 = min(len(tile_grid) - 1, cr + radius)
-        c0 = max(0, cc - radius)
-        c1 = min(len(tile_grid[0]) - 1, cc + radius)
-        for r in range(r0, r1 + 1):
-            for c in range(c0, c1 + 1):
-                key = tile_grid[r][c]
-                cls = key.split(":", 1)[-1]
-                est = pass_store.get_estimate(cls, key)
-                if abs(est.instance_mean - 0.5) < 0.05:
-                    unseen.append((r, c))
-        unseen.sort(key=lambda coord: self._distance(coord, center))
-        dedup: List[Coord] = []
-        for coord in unseen:
-            if coord not in dedup:
-                dedup.append(coord)
-            if len(dedup) >= count:
-                break
-        return dedup
+        # With direct RAM-backed passability we don't maintain uncertainty heuristics.
+        # Retain method for call-site compatibility; return no extra candidates.
+        return []
 
     # ------------------------------------------------------------------ helpers
     def _ensure_seed(self, grid_shape: Tuple[int, int]) -> None:

@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 __all__ = [
     "MapMetadataLoader",
@@ -62,6 +62,8 @@ class MapMetadataLoader:
         self._map_names: Dict[int, str] = {}
         self._map_const: Dict[str, str] = {}
         self._hidden_objects: Dict[str, List[MapInteractable]] = {}
+        self._tileset_collisions: Dict[str, Set[int]] = self._load_tileset_collisions()
+        self._map_tileset_cache: Dict[int, Optional[str]] = {}
 
     # ------------------------------------------------------------------ public
     def get_portals(self, map_id: int) -> List[MapPortal]:
@@ -82,6 +84,24 @@ class MapMetadataLoader:
             return None
         const = self._map_const_lookup().get(name)
         return const or name
+
+    def tileset_for_map(self, map_id: int) -> Optional[str]:
+        if map_id in self._map_tileset_cache:
+            return self._map_tileset_cache[map_id]
+        name = self._map_names_lookup().get(map_id)
+        if not name:
+            self._map_tileset_cache[map_id] = None
+            return None
+        tileset = self._parse_map_header_tileset(name)
+        self._map_tileset_cache[map_id] = tileset
+        return tileset
+
+    def collision_ids(self, map_id: int) -> Set[int]:
+        tileset = self.tileset_for_map(map_id)
+        if not tileset:
+            return set()
+        key = self._normalize_tileset_label(tileset)
+        return set(self._tileset_collisions.get(key, set()))
 
     # ---------------------------------------------------------------- internal
     @lru_cache(maxsize=None)
@@ -272,6 +292,67 @@ class MapMetadataLoader:
                     text_id=text_id,
                     routine=sprite,
                 )
-            )
+                )
         return interactables
 
+    # ----------------------------- tileset helpers ----------------------------
+    def _load_tileset_collisions(self) -> Dict[str, Set[int]]:
+        collisions: Dict[str, Set[int]] = {}
+        path = self._root / "data" / "tilesets" / "collision_tile_ids.asm"
+        if not path.exists():
+            return collisions
+        pending_labels: List[str] = []
+        for raw_line in path.read_text(encoding="ascii", errors="ignore").splitlines():
+            line = raw_line.split(";", 1)[0].strip()
+            if not line:
+                continue
+            if line.endswith("::"):
+                pending_labels.append(line[:-2])
+                continue
+            if not line.startswith("coll_tiles"):
+                continue
+            args = line[len("coll_tiles") :].strip()
+            values: List[int] = []
+            if args:
+                tokens = [tok.strip() for tok in args.split(",") if tok.strip()]
+                for token in tokens:
+                    if token.startswith("$"):
+                        values.append(int(token[1:], 16))
+                    else:
+                        values.append(int(token, 0))
+            for label in pending_labels or ["_UNNAMED_"]:
+                key = self._normalize_tileset_label(label)
+                collisions[key] = set(values)
+            pending_labels.clear()
+        return collisions
+
+    def _normalize_tileset_label(self, label: str) -> str:
+        name = re.sub(r"_Coll$", "", label, flags=re.IGNORECASE)
+        # Convert CamelCase (and digits) to uppercase underscore format.
+        parts: List[str] = []
+        token = ""
+        for idx, ch in enumerate(name):
+            if idx > 0 and (
+                (ch.isupper() and (name[idx - 1].islower() or (idx + 1 < len(name) and name[idx + 1].islower())))
+                or (ch.isdigit() and not name[idx - 1].isdigit())
+            ):
+                parts.append(token)
+                token = ch
+            else:
+                token += ch
+        if token:
+            parts.append(token)
+        return "_".join(part.upper() for part in parts if part)
+
+    def _parse_map_header_tileset(self, map_name: str) -> Optional[str]:
+        header_path = self._root / "data" / "maps" / "headers" / f"{map_name}.asm"
+        if not header_path.exists():
+            return None
+        for raw_line in header_path.read_text(encoding="ascii", errors="ignore").splitlines():
+            line = raw_line.split(";", 1)[0].strip()
+            if not line or not line.startswith("map_header"):
+                continue
+            parts = [part.strip() for part in line[len("map_header") :].split(",")]
+            if len(parts) >= 3:
+                return parts[2]
+        return None

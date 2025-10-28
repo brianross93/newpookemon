@@ -1,7 +1,6 @@
 import numpy as np
 
 from beater.executor import PlanletExecutor, SpriteMovementDetector
-from beater.sr_memory import PassabilityStore
 from beater.types import Observation, Planlet, ScriptOp
 
 
@@ -30,11 +29,10 @@ class DummyEnv:
         self._rgb[70:74, self._sprite_col : self._sprite_col + 4, :] = 255
 
 
-def test_executor_updates_passability():
+def test_executor_sets_nav_success():
     env = DummyEnv()
-    store = PassabilityStore()
     detector = SpriteMovementDetector(diff_threshold=5.0, min_pixels=4, roi_ratio=0.8, success_px=0.5)
-    executor = PlanletExecutor(env, store, detector)
+    executor = PlanletExecutor(env, detector)
     steps = [
         {
             "script": [ScriptOp(op="WAIT", frames=1)],
@@ -51,6 +49,4 @@ def test_executor_updates_passability():
         timeout_steps=1,
     )
     executor.run(planlet)
-    estimate = store.get_estimate("class_safe", "room:class_safe")
-    assert estimate.blended > 0.5
     assert planlet.args.get("nav_success") is True

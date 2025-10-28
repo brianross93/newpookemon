@@ -1,87 +1,81 @@
-"""Tile-class aware navigation planner with Thompson sampling."""
+"""Breadth-first navigation planner driven by RAM-backed collision data."""
 
 from __future__ import annotations
 
-import heapq
+from collections import deque
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
-from beater.sr_memory import PassabilityStore
-
-Grid = List[List[str]]
 Coord = Tuple[int, int]
 
 
 @dataclass(slots=True)
 class NavPlannerConfig:
-    thompson_retries: int = 4
-    epsilon: float = 1e-3
+    """Configuration for RAM-backed navigation."""
+
+    max_expansions: Optional[int] = None  # Optional cap on BFS expansions.
 
 
 class NavPlanner:
-    def __init__(self, store: PassabilityStore, config: NavPlannerConfig | None = None):
-        self.store = store
+    """Compute grid paths using BFS over a boolean passability mask."""
+
+    def __init__(self, config: NavPlannerConfig | None = None):
         self.config = config or NavPlannerConfig()
 
-    def plan(self, tile_grid: Grid, start: Coord, goal: Coord) -> List[Coord]:
-        if not tile_grid:
+    def plan(self, passable: Sequence[Sequence[bool]], start: Coord, goal: Coord) -> List[Coord]:
+        rows = len(passable)
+        if rows == 0:
             return []
-        best_path: List[Coord] = []
-        best_cost = float("inf")
-        for _ in range(max(1, self.config.thompson_retries)):
-            costs = self._sample_cost_grid(tile_grid)
-            path, cost = self._shortest_path(costs, start, goal)
-            if path and cost < best_cost:
-                best_path, best_cost = path, cost
-        return best_path
+        cols = len(passable[0])
+        if cols == 0:
+            return []
+        if not self._in_bounds(start, rows, cols) or not self._in_bounds(goal, rows, cols):
+            return []
+        if not passable[start[0]][start[1]] or not passable[goal[0]][goal[1]]:
+            return []
 
-    def _sample_cost_grid(self, tile_grid: Grid) -> List[List[float]]:
-        cost_grid: List[List[float]] = []
-        for row in tile_grid:
-            cost_row: List[float] = []
-            for key in row:
-                tile_class = key.split(":", 1)[-1]
-                prob = self.store.sample(tile_class, key)
-                prob = max(prob, self.config.epsilon)
-                cost_row.append(1.0 / prob)
-            cost_grid.append(cost_row)
-        return cost_grid
+        queue: deque[Coord] = deque([start])
+        came_from: dict[Coord, Coord] = {start: start}
+        expansions = 0
 
-    def _shortest_path(
-        self, cost_grid: List[List[float]], start: Coord, goal: Coord
-    ) -> Tuple[List[Coord], float]:
-        h = len(cost_grid)
-        w = len(cost_grid[0])
-        in_bounds = lambda r, c: 0 <= r < h and 0 <= c < w
-        dist = {(start[0], start[1]): 0.0}
-        prev: dict[Coord, Coord] = {}
-        heap: List[Tuple[float, Coord]] = [(0.0, start)]
-
-        while heap:
-            cur_cost, (r, c) = heapq.heappop(heap)
-            if (r, c) == goal:
-                return self._reconstruct(prev, start, goal), cur_cost
-            if cur_cost > dist[(r, c)]:
-                continue
-            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nr, nc = r + dr, c + dc
-                if not in_bounds(nr, nc):
+        while queue:
+            current = queue.popleft()
+            if current == goal:
+                return self._reconstruct_path(came_from, start, goal)
+            expansions += 1
+            if self.config.max_expansions and expansions > self.config.max_expansions:
+                break
+            for neighbor in self._neighbors(current):
+                r, c = neighbor
+                if not self._in_bounds(neighbor, rows, cols):
                     continue
-                neigh_cost = cur_cost + cost_grid[nr][nc]
-                if neigh_cost < dist.get((nr, nc), float("inf")):
-                    dist[(nr, nc)] = neigh_cost
-                    prev[(nr, nc)] = (r, c)
-                    heapq.heappush(heap, (neigh_cost, (nr, nc)))
-        return [], float("inf")
+                if not passable[r][c]:
+                    continue
+                if neighbor in came_from:
+                    continue
+                came_from[neighbor] = current
+                queue.append(neighbor)
+        return []
 
     @staticmethod
-    def _reconstruct(prev: dict[Coord, Coord], start: Coord, goal: Coord) -> List[Coord]:
-        if goal not in prev and goal != start:
-            return []
-        path = [goal]
+    def _in_bounds(coord: Coord, rows: int, cols: int) -> bool:
+        r, c = coord
+        return 0 <= r < rows and 0 <= c < cols
+
+    @staticmethod
+    def _neighbors(coord: Coord) -> Iterable[Coord]:
+        r, c = coord
+        yield (r + 1, c)
+        yield (r - 1, c)
+        yield (r, c + 1)
+        yield (r, c - 1)
+
+    @staticmethod
+    def _reconstruct_path(came_from: dict[Coord, Coord], start: Coord, goal: Coord) -> List[Coord]:
+        path: List[Coord] = [goal]
         cur = goal
         while cur != start:
-            cur = prev[cur]
+            cur = came_from[cur]
             path.append(cur)
         path.reverse()
         return path

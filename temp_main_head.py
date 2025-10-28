@@ -302,13 +302,8 @@ def _known_entity_script(script_id: Optional[str]) -> List[ScriptOp]:
         script.append(ScriptOp(op="WAIT", frames=45))
         script.extend(_button_script("A", press_frames=3, wait_frames=4))
         script.append(ScriptOp(op="WAIT", frames=45))
-        # Confirm Withdraw menu, select Potion, and acknowledge scoop-up text.
         script.extend(_button_script("A", press_frames=3, wait_frames=4))
         script.append(ScriptOp(op="WAIT", frames=50))
-        script.extend(_button_script("A", press_frames=3, wait_frames=4))
-        script.append(ScriptOp(op="WAIT", frames=40))
-        script.extend(_button_script("A", press_frames=3, wait_frames=4))
-        script.append(ScriptOp(op="WAIT", frames=40))
         script.extend(_button_script("B", press_frames=3, wait_frames=4))
         script.append(ScriptOp(op="WAIT", frames=35))
         script.extend(_button_script("B", press_frames=3, wait_frames=4))
@@ -931,7 +926,6 @@ def main() -> None:
                     LOGGER.info("Objective reset post-naming: %s", objective.summary())
                 except Exception as exc:
                     LOGGER.exception("Failed to reset naming objective: %s", exc)
-                phase_halt_pending = "boot"
             menu_detected = detect_menu_open(obs.ram, tile_grid)
             if menu_detected:
                 menu_cooldown = max(menu_cooldown, 60)
@@ -1639,6 +1633,7 @@ def main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
+
 
 
 
