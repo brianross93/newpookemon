@@ -46,9 +46,10 @@ class NavPlanletBuilder:
             if button is None:
                 continue
             step_script = [
-                ScriptOp(op="PRESS", button=button, frames=1),
-                ScriptOp(op="WAIT", frames=self.wait_frames),
+                ScriptOp(op="PRESS", button=button, frames=3),
+                ScriptOp(op="WAIT", frames=self.wait_frames + 1),
                 ScriptOp(op="RELEASE", button=button),
+                ScriptOp(op="WAIT", frames=1),
             ]
             flat_script.extend(step_script)
             tile_key = tile_grid[cur[0]][cur[1]]
