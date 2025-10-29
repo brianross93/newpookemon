@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import random
 import uuid
@@ -39,7 +38,7 @@ from beater.policy import (
     PlanHead,
     PlanHeadConfig,
 )
-from beater.sr_memory import EntityGraph, GraphOp, PassabilityStore
+from beater.sr_memory import EntityGraph, GraphOp
 from beater.training import (
     GroundedRolloutCollector,
     PPOConfig,
@@ -50,6 +49,15 @@ from beater.types import Observation, Planlet, PlanletKind, ScriptOp
 from beater.utils.detectors import detect_menu_open, scene_change_delta
 from beater.utils.maps import ascii_tile_map
 from beater.utils.map_metadata import MapInteractable, MapMetadataLoader, MapPortal
+from beater.utils.ram_map import (
+    SCREEN_HEIGHT,
+    SCREEN_WIDTH,
+    W_TILE_MAP_ADDR,
+    boundary_exit_candidates,
+    passable_mask,
+    read_tile_map,
+    tokens_from_tile_map,
+)
 
 LOGGER = logging.getLogger("beater")
 GRAPH_OPS: tuple[GraphOp, ...] = tuple(GraphOp)
@@ -221,7 +229,11 @@ def _naming_state(ram: Optional["np.ndarray"]) -> NamingState:
     else:
         subscreen = "none"
     buf = _decode_poke_text(ram[0xCF4B : 0xCF4B + 11])
-    active = kind != "none" and subscreen != "none"
+    submit_flag = int(ram[0xD048]) if len(ram) > 0xD048 else 0xFF
+    alphabet_case = int(ram[0xD049]) if len(ram) > 0xD049 else 0xFF
+    submit_valid = submit_flag in (0, 1)
+    alphabet_valid = alphabet_case in (0, 1)
+    active = kind != "none" and subscreen != "none" and submit_valid and alphabet_valid
     return NamingState(active, kind, subscreen, buf, len(buf))
 
 
@@ -236,8 +248,18 @@ def _naming_ops_for_state(ns: NamingState) -> List[str]:
     ops: List[str] = []
     if ns.subscreen == "grid":
         ops.extend(["B", "WAIT_12"])
-    ops.extend(["DOWN", "WAIT_10", "A", "WAIT_32"])
-    ops.extend(_confirm_burst_A(count=2, gap=30))
+    ops.extend(
+        [
+            "DOWN",
+            "WAIT_12",
+            "A",
+            "WAIT_40",
+            "A",
+            "WAIT_40",
+            "A",
+            "WAIT_40",
+        ]
+    )
     return ops
 
 
@@ -393,29 +415,25 @@ def _boost_portal_scores(
 
 
 def _should_random_walk(
-    tile_grid: List[List[str]],
+    passable_grid: List[List[bool]],
     anchor: Tuple[int, int],
-    pass_store: PassabilityStore,
-    threshold: float = 0.15,
 ) -> bool:
-    """Heuristic: return True when surrounding tiles are largely unknown/blocked."""
+    """Heuristic: return True when the agent is boxed in by impassable tiles."""
 
+    if not passable_grid:
+        return False
+    rows = len(passable_grid)
+    cols = len(passable_grid[0])
     r, c = anchor
     known = 0
     open_tiles = 0
     for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
         nr, nc = r + dr, c + dc
-        if nr < 0 or nc < 0 or nr >= len(tile_grid) or nc >= len(tile_grid[nr]):
+        if nr < 0 or nc < 0 or nr >= rows or nc >= cols:
             continue
-        key = tile_grid[nr][nc]
-        cls = key.split(":", 1)[-1]
-        est = pass_store.get_estimate(cls, key)
-        # Treat as known if instance mean has diverged from neutral prior.
-        if abs(est.instance_mean - 0.5) > 0.05:
-            known += 1
-            if est.blended > threshold:
-                open_tiles += 1
-    # Random walk when we barely know surroundings or all known tiles are blocked.
+        known += 1
+        if passable_grid[nr][nc]:
+            open_tiles += 1
     return known <= 1 or open_tiles == 0
 
 
@@ -514,13 +532,12 @@ def build_policy(cfg: dict[str, Any], latent_dim: int) -> tuple[Controller, Plan
     return controller, plan_head, skill_vocab
 
 
-def build_nav_planner(cfg: dict[str, Any], store: PassabilityStore) -> NavPlanner:
+def build_nav_planner(cfg: dict[str, Any]) -> NavPlanner:
     nav_cfg = cfg.get("nav_planner", {})
     config = NavPlannerConfig(
-        thompson_retries=int(nav_cfg.get("thompson_retries", 4)),
-        epsilon=float(nav_cfg.get("epsilon", 1e-3)),
+        max_expansions=int(nav_cfg.get("max_expansions", 1000)),
     )
-    return NavPlanner(store, config)
+    return NavPlanner(config)
 
 
 def build_trainer(cfg: dict[str, Any], controller: Controller, affordance: AffordancePrior) -> tuple[PPOTrainer, dict[str, Any]]:
@@ -584,7 +601,6 @@ def main() -> None:
     option_bank = OptionBank()
     goal_manager_cli = GoalManager()
     graph = EntityGraph()
-    pass_store = PassabilityStore()
     portal_scores: Dict[str, float] = {}
     initial_class_ids: Optional[torch.Tensor] = None
     initial_grid_shape: Optional[Tuple[int, int]] = None
@@ -608,10 +624,10 @@ def main() -> None:
     downstairs_exit_plan: Optional[Planlet] = None
     downstairs_exit_goal: Optional[Tuple[int, int]] = None
     downstairs_script_done = False
-    nav_planner = build_nav_planner(cfg, pass_store)
+    nav_planner = build_nav_planner(cfg)
     nav_builder = NavPlanletBuilder()
     movement_detector = SpriteMovementDetector()
-    executor = PlanletExecutor(env, pass_store, movement_detector)
+    executor = PlanletExecutor(env, movement_detector)
     trainer, train_cfg = build_trainer(cfg, controller, affordance)
     LOGGER.info("Environment initialized with ROM=%s", env.config.rom_path)
     controller_state: Optional[ControllerState] = None
@@ -664,18 +680,47 @@ def main() -> None:
             frame_id = graph.add_entity("frame", z.squeeze(0), {"step_idx": obs.step_idx})
             assoc = graph.assoc(z.squeeze(0), top_k=1)
             tile_out = tile_descriptor(rgb_tensor)
-            tile_keys = tile_descriptor.tile_keys(tile_out.class_ids, tile_out.grid_shape)
-            tile_grid = tile_descriptor.reshape_tokens(tile_keys[0], tile_out.grid_shape)
-            anchor = goal_manager_cli.player_anchor(tile_out.grid_shape)
-            anchor_key = tile_grid[anchor[0]][anchor[1]]
-            _, tile_class = anchor_key.split(":", 1)
-            nav_est = pass_store.get_estimate(tile_class, anchor_key)
-            candidates = goal_manager_cli.peek_candidates(
-                tile_out.grid_shape, brain_candidate_preview
+            grid_shape = tile_out.grid_shape
+            tile_grid: List[List[str]] = []
+            passable_grid: List[List[bool]] = []
+            tile_map: Optional[List[List[int]]] = None
+            ram_data = obs.ram
+            ram_ready = (
+                ram_data is not None
+                and len(ram_data) >= (W_TILE_MAP_ADDR + SCREEN_HEIGHT * SCREEN_WIDTH)
             )
-            candidates = list(candidates)
+            if ram_ready:
+                try:
+                    tile_map = read_tile_map(ram_data)
+                    tile_grid = tokens_from_tile_map(tile_map)
+                except Exception as exc:
+                    LOGGER.debug("Failed to read tile map at step=%s: %s", obs.step_idx, exc)
+                    tile_map = None
+                    tile_grid = []
+            if not tile_grid:
+                tile_keys = tile_descriptor.tile_keys(tile_out.class_ids, grid_shape)
+                tile_grid = tile_descriptor.reshape_tokens(tile_keys[0], grid_shape)
+            if tile_map is not None:
+                map_id = map_tuple_before[1] if map_tuple_before is not None else None
+                collisions = MAP_METADATA.collision_ids(map_id) if map_id is not None else set()
+                passable_grid = passable_mask(tile_map, collisions)
+            else:
+                passable_grid = [[True for _ in range(grid_shape[1])] for _ in range(grid_shape[0])]
+            anchor = goal_manager_cli.player_anchor(grid_shape)
+            anchor_passable = (
+                0 <= anchor[0] < len(passable_grid)
+                and 0 <= anchor[1] < len(passable_grid[anchor[0]])
+                and passable_grid[anchor[0]][anchor[1]]
+            )
+            candidates = list(goal_manager_cli.peek_candidates(grid_shape, brain_candidate_preview))
+            boundary_targets = boundary_exit_candidates(
+                passable_grid, anchor, limit=max(4, brain_candidate_preview * 2)
+            )
+            for coord in boundary_targets:
+                if coord not in candidates:
+                    candidates.insert(0, coord)
             unseen_for_prompt = goal_manager_cli.unseen_candidates(
-                tile_out.grid_shape, tile_grid, pass_store, brain_candidate_preview
+                grid_shape, tile_grid, brain_candidate_preview
             )
             if unseen_for_prompt:
                 interleaved: List[Tuple[int, int]] = []
@@ -1047,21 +1092,27 @@ def main() -> None:
                             continue
                 cand_meta = []
                 for (r, c) in candidates:
+                    if r < 0 or c < 0 or r >= len(tile_grid) or c >= len(tile_grid[r]):
+                        continue
                     key = tile_grid[r][c]
-                    cls = key.split(":", 1)[-1]
-                    est = pass_store.get_estimate(cls, key)
+                    passable_flag = (
+                        0 <= r < len(passable_grid)
+                        and 0 <= c < len(passable_grid[r])
+                        and passable_grid[r][c]
+                    )
                     cand_meta.append({
-                        "passability": est.blended,
+                        "passability": 1.0 if passable_flag else 0.0,
                         "fail_count": goal_manager_cli.get_fail_count((r, c)),
                         "portal_score": portal_scores.get(key, 0.0),
                         "interact_bonus": interact_bonus_map.get((r, c), 0.0),
+                        "boundary_hint": (r, c) in boundary_targets,
                         "known_prefer": (r, c) in prefer_coords,
                     })
 
                 context_payload = {
                     "step": obs.step_idx,
                     "assoc_matches": len(assoc),
-                    "passability": nav_est.blended,
+                    "passability": 1.0 if anchor_passable else 0.0,
                     "ascii_map": ascii_map,
                     "phase": phase_state,
                     "menu_open": menu_open,
@@ -1302,26 +1353,31 @@ def main() -> None:
                         args={"auto_menu": True},
                         script=script,
                         timeout_steps=len(script),
-            )
+                    )
+            # Ensure later code has defaults regardless of auto-close branch.
             goal_coord = None
             nav_path: List[tuple[int, int]] = []
             if planlet.kind == "NAVIGATE":
                 # Passability-weighted goal selection
                 def _score_goal(g: tuple[int, int]) -> float:
-                    path = nav_planner.plan(tile_grid, start=anchor, goal=g)
+                    path = nav_planner.plan(passable_grid, start=anchor, goal=g)
                     if not path or len(path) < 2:
                         return -1e9
                     # Score by mean blended passability along first few steps
                     horizon = min(6, len(path))
-                    ps: List[float] = []
+                    open_steps = 0
                     for (r, c) in path[1:horizon]:
-                        key = tile_grid[r][c]
-                        cls = key.split(":", 1)[-1]
-                        est = pass_store.get_estimate(cls, key)
-                        ps.append(float(est.blended))
-                    avg_pass = float(sum(ps) / max(1, len(ps)))
-                    goal_key = tile_grid[g[0]][g[1]]
-                    portal_bonus = portal_scores.get(goal_key, 0.0) * 0.5
+                        if (
+                            0 <= r < len(passable_grid)
+                            and 0 <= c < len(passable_grid[r])
+                            and passable_grid[r][c]
+                        ):
+                            open_steps += 1
+                    avg_pass = open_steps / max(1, horizon - 1)
+                    goal_key = ""
+                    if 0 <= g[0] < len(tile_grid) and 0 <= g[1] < len(tile_grid[g[0]]):
+                        goal_key = tile_grid[g[0]][g[1]]
+                    portal_bonus = portal_scores.get(goal_key, 0.0) * 0.5 if goal_key else 0.0
                     interact_bonus = interact_bonus_map.get((g[0], g[1]), 0.0)
                     dist = len(path)
                     return avg_pass + portal_bonus + interact_bonus - 0.01 * dist
@@ -1348,12 +1404,16 @@ def main() -> None:
                         sel_goal = None
                 if sel_goal is None:
                     sel_goal = goal_manager_cli.next_goal(
-                    tile_out.grid_shape,
-                    preferred=planlet.kind,
-                    goal_override=brain_goal_override,
-                )
+                        tile_out.grid_shape,
+                        preferred=planlet.kind,
+                        goal_override=brain_goal_override,
+                    )
                 goal_coord = sel_goal
-                nav_path = nav_planner.plan(tile_grid, start=anchor, goal=goal_coord)
+                nav_path = (
+                    nav_planner.plan(passable_grid, start=anchor, goal=goal_coord)
+                    if goal_coord is not None
+                    else []
+                )
                 if nav_path and len(nav_path) > 1:
                     # Truncate horizon to adapt quickly
                     horizon_nodes = nav_path[: min(4, len(nav_path))]
@@ -1361,7 +1421,7 @@ def main() -> None:
                     committed_goal = goal_coord
                     commit_steps_remaining = max(commit_steps_remaining, 6)
                 else:
-                    if _should_random_walk(tile_grid, anchor, pass_store) and not menu_open:
+                    if _should_random_walk(passable_grid, anchor) and not menu_open:
                         steps = random.randint(3, 5)
                         dirs = random.choices(["UP", "DOWN", "LEFT", "RIGHT"], k=steps)
                         script: List[ScriptOp] = []
@@ -1405,41 +1465,64 @@ def main() -> None:
             halt_cooldown = max(halt_cooldown, halt_cooldown_steps)
             last_naming_script_step = obs.step_idx
             LOGGER.info("Naming complete step=%s buffer='%s'", obs.step_idx, prev_ns.buffer)
-        next_rgb_tensor = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
-        next_tile_out = tile_descriptor(next_rgb_tensor)
-        next_tile_keys = tile_descriptor.tile_keys(next_tile_out.class_ids, next_tile_out.grid_shape)
-        if planlet.kind == "NAVIGATE":
-            step_results = planlet.args.get("step_results", []) if isinstance(planlet.args, dict) else []
-            if isinstance(step_results, list):
-                for step_result in step_results:
-                    tile_key = step_result.get("tile_id")
-                    if not isinstance(tile_key, str):
-                        rc = step_result.get("rc")
-                        if isinstance(rc, (list, tuple)) and len(rc) == 2:
-                            rr, cc = rc
-                            if (
-                                isinstance(rr, (int, float))
-                                and isinstance(cc, (int, float))
-                            ):
-                                rr_i = int(rr)
-                                cc_i = int(cc)
-                                if (
-                                    0 <= rr_i < next_tile_out.grid_shape[0]
-                                    and 0 <= cc_i < next_tile_out.grid_shape[1]
-                                    and next_tile_keys
-                                    and next_tile_keys[0]
-                                    and rr_i < len(next_tile_keys[0])
-                                    and cc_i < len(next_tile_keys[0][rr_i])
-                                ):
-                                    tile_key = next_tile_keys[0][rr_i][cc_i]
-                    if isinstance(tile_key, str):
-                        cls = tile_key.split(":", 1)[-1]
-                        pass_store.update(cls, tile_key, success=bool(step_result.get("success", False)))
         if (
             map_tuple_before is not None
             and map_tuple_after is not None
             and map_tuple_after != map_tuple_before
         ):
+            if (
+                map_tuple_before == (0, 0)
+                and map_tuple_after == (18, 38)
+                and not downstairs_script_done
+            ):
+                try:
+                    obs = env.step_script(DOWNSTAIRS_EGRESS_SCRIPT)
+                    downstairs_script_done = True
+                    current_phase_tag = "downstairs"
+                    LOGGER.info("Ran downstairs egress script after upstairs->downstairs transition")
+                    tensor_after = torch.from_numpy(obs.rgb).permute(2, 0, 1).unsqueeze(0)
+                    tile_out_after = tile_descriptor(tensor_after)
+                    tile_keys_after = tile_descriptor.tile_keys(
+                        tile_out_after.class_ids, tile_out_after.grid_shape
+                    )
+                    tile_grid_after = tile_descriptor.reshape_tokens(
+                        tile_keys_after[0], tile_out_after.grid_shape
+                    )
+                    tile_map_after = (
+                        read_tile_map(obs.ram)
+                        if obs.ram is not None and len(obs.ram) >= (W_TILE_MAP_ADDR + SCREEN_HEIGHT * SCREEN_WIDTH)
+                        else None
+                    )
+                    collisions_after = MAP_METADATA.collision_ids(map_tuple_after[1])
+                    passable_after = (
+                        passable_mask(tile_map_after, collisions_after)
+                        if tile_map_after is not None
+                        else [[True for _ in range(tile_out_after.grid_shape[1])] for _ in range(tile_out_after.grid_shape[0])]
+                    )
+                    anchor_after = goal_manager_cli.player_anchor(tile_out_after.grid_shape)
+                    best_path: Optional[List[Tuple[int, int]]] = None
+                    best_goal: Optional[Tuple[int, int]] = None
+                    for goal in DOWNSTAIRS_EXIT_CANDIDATES:
+                        path = nav_planner.plan(passable_after, start=anchor_after, goal=goal)
+                        if path and len(path) > 1:
+                            if best_path is None or len(path) < len(best_path):
+                                best_path = path
+                                best_goal = goal
+                    if best_path and best_goal:
+                        downstairs_exit_plan = nav_builder.from_path(
+                            best_path, tile_grid_after, goal=best_goal
+                        )
+                        downstairs_exit_goal = best_goal
+                        LOGGER.info(
+                            "Primed downstairs exit plan goal=%s path_len=%s (map-change hook)",
+                            best_goal,
+                            len(best_path),
+                        )
+                    initial_class_ids = tile_out_after.class_ids.clone()
+                    continue
+                except Exception as exc:
+                    downstairs_script_done = True
+                    LOGGER.exception("Downstairs egress script failed (map-change hook): %s", exc)
             portal_scores.clear()
             new_map = map_tuple_after not in seen_maps
             seen_maps.add(map_tuple_after)
@@ -1574,7 +1657,7 @@ def main() -> None:
         last_rollout_stats = {
             "obs": obs,
             "assoc": assoc,
-            "nav_est": nav_est,
+            "nav_passable": anchor_passable,
             "planlet": planlet,
             "nav_path_len": len(nav_path),
             "z_shape": tuple(z.shape),
@@ -1601,7 +1684,6 @@ def main() -> None:
         goal_manager=training_goal_manager,
         brain=brain_for_rollouts,
         brain_candidate_preview=brain_candidate_preview,
-        pass_store=pass_store,
         reward_fn=gate_skill_reward,
         env_factory=env_factory,
         movement_detector_factory=lambda: SpriteMovementDetector(),
@@ -1627,7 +1709,7 @@ def main() -> None:
         last_rollout_stats.get("z_shape", ()),
         last_rollout_stats.get("rnd_shape", ()),
         last_rollout_stats.get("assoc"),
-        last_rollout_stats.get("nav_est"),
+        last_rollout_stats.get("nav_passable"),
         last_rollout_stats.get("planlet"),
         last_rollout_stats.get("nav_path_len"),
         train_stats,
